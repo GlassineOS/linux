@@ -849,8 +849,15 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		data = DSI_VID_CFG1_RGB_SWAP(SWAP_RGB);
 		dsi_write(msm_host, REG_DSI_VID_CFG1, 0);
 	} else {
-		/* Do not swap RGB colors */
-		data = DSI_CMD_CFG0_RGB_SWAP(SWAP_RGB);
+		/*
+		 * Do not swap RGB colors, unless the board asks for the downstream
+		 * "rgb_swap_grb" order (Onyx NA1 e-ink wire link: the bridge pins
+		 * expect the stock byte order).
+		 */
+		if (of_property_read_bool(msm_host->pdev->dev.of_node, "qcom,cmd-rgb-swap-grb"))
+			data = DSI_CMD_CFG0_RGB_SWAP(SWAP_GRB);
+		else
+			data = DSI_CMD_CFG0_RGB_SWAP(SWAP_RGB);
 		data |= DSI_CMD_CFG0_DST_FORMAT(dsi_get_cmd_fmt(mipi_fmt));
 		dsi_write(msm_host, REG_DSI_CMD_CFG0, data);
 
