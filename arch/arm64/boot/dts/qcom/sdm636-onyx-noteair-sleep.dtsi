@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Onyx Note Air sleep support: everything needed for the RPM to shut XO
+ * down (qcom_stats vlow/vmin) in s2idle.
+ *
+ * 1. System level + MPM.
+ *    Above both clusters: stock's "system-pc" (psci mode 3 at shift 8, min child
+ *    L2 pc, notify-rpm) = 0x42000343 (affinity level 2). Its parent is the MPM
+ *    power domain, whose power-off hands the wake mask to RPM (vMPM in RPM
+ *    message RAM + an APCS IPC ping). Without it the RPM never sees the APSS
+ *    asleep. Once XO is off only MPM pins wake the SoC: SPMI (power key, RTC,
+ *    charger) and the TLMM wake map (hall = GPIO 105 = MPM pin 85).
+ *    This alone entered system-pc but vlow stayed 0, because of 2:
+ *
+ * 2. mmcc's XO parent = the active-only RPM XO. Every prepared mmcc clock is a
+ *    vote for its parent, and RPM_SMD_XO_CLK_SRC votes in the RPM sleep set too.
+ *    video_core_clk_src is CLK_IS_CRITICAL and mdss_ahb_clk stays prepared (only
+ *    its enable drops at DPU suspend), so the APSS held XO in the sleep set for
+ *    good (clock trace, 2026-09-30). Nothing in mmcc
+ *    runs while the APSS sleeps. The DSI PHY PLL reference is xo_board directly,
+ *    not via mmcc.
+ */
+
+&{/cpus} {
+	domain-idle-states {
+		system_pc: system-pc {
+			compatible = "domain-idle-state";
+			arm,psci-suspend-param = <0x42000343>;
+			/* stock: latency 4506 us, time overhead 15337 us */
+			entry-latency-us = <1000>;
+			exit-latency-us = <3500>;
+			/*
+			 * 10 s instead of stock's ~15 ms: s2idle only. At runtime
+			 * (cpu_power_down_ok) the next wakeup of all CPUs must be
+			 * >= residency away, which practically never happens, while
+			 * s2idle (cpu_system_power_down_ok) only checks the latencies.
+			 * With the stock residency it entered system-pc 3000+ times
+			 * awake and the GPU faulted 3x in 8 min (0 all day without
+			 * it); runtime RPM handoff is its own later step.
+			 */
+			min-residency-us = <10000000>;
+		};
+	};
+
+};
+
+/* under /psci like the cluster domains: psci_cpuidle_domain_probe only creates
+ * the domains that are children of the psci node (under /cpus nothing provided
+ * system_pd, the clusters deferred for good and the error path oopsed at boot) */
+&{/psci} {
+	system_pd: power-domain-system {
+		#power-domain-cells = <0>;
+		power-domains = <&mpm>;
+		domain-idle-states = <&system_pc>;
+	};
+};
+
+&cluster0_pd {
+	power-domains = <&system_pd>;
+};
+
+&cluster1_pd {
+	power-domains = <&system_pd>;
+};
+
+/* the APSS slice of the RPM message RAM that holds the vMPM registers
+ * (stock qcom,mpm@7781b8 "vmpm") */
+&rpm_msg_ram {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	ranges = <0 0x00778000 0x7000>;
+
+	apss_mpm: sram@1b8 {
+		reg = <0x1b8 0x48>;
+	};
+};
+
+&{/soc@0} {
+	/* stock qcom,mpm@7781b8 (mpm-v2): wake IRQ SPI 171, IPC bit 1, 96 pins;
+	 * pin map = its gic-map minus 32 (TSENS, the USB PHYs, SPMI), one pin
+	 * per SPI (stock maps QUSB2 DP/DM twice; the SPMI charger covers USB
+	 * plug-in anyway); GPIOs: pinctrl-sdm660's wake map */
+	mpm: interrupt-controller {
+		compatible = "qcom,mpm";
+		qcom,rpm-msg-ram = <&apss_mpm>;
+		interrupts = <GIC_SPI 171 IRQ_TYPE_EDGE_RISING>;
+		mboxes = <&apcs_glb 1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#power-domain-cells = <0>;
+		interrupt-parent = <&intc>;
+		qcom,mpm-pin-count = <96>;
+		qcom,mpm-pin-map = <2 184>,	/* TSENS uplow */
+				   <52 243>,	/* USB3 hs_phy */
+				   <79 347>,	/* USB3 QUSB2 PHY */
+				   <80 348>,	/* USB2 QUSB2 PHY */
+				   <87 326>;	/* SPMI: power key, RTC, charger */
+	};
+};
+
+&spmi_bus {
+	/delete-property/ interrupts;
+	interrupts-extended = <&mpm 87 IRQ_TYPE_LEVEL_HIGH>;
+};
+
+&tlmm {
+	wakeup-parent = <&mpm>;
+};
+
+&mmcc {
+	/* the list from sdm660.dtsi (sdm636 includes it; adds the dsi1 PLL), XO_A first */
+	clocks = <&rpmcc RPM_SMD_XO_A_CLK_SRC>,
+		 <&sleep_clk>,
+		 <&gcc GCC_MMSS_GPLL0_CLK>,
+		 <&gcc GCC_MMSS_GPLL0_DIV_CLK>,
+		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
+		 <0>,
+		 <0>;
+};
+
+/*
+ * RPM sleep-set votes (the qcom_smd regulator sleep-set patch): a
+ * regulator voting only the active set keeps that vote asleep, so forced HPM
+ * loads (l8a 325 mA, l4b 570 mA) stayed HPM through suspend. Stock votes both
+ * sets (qcom,set = <3>). Here: enable + uV as active, load 0 (LPM) asleep.
+ * Not tagged: the WCN3990 rails (l5a l6a l9a l19a; stock pin-controls them)
+ * and the parent supplies (s4a s5a s2b bob). Bisect by removing lines.
+ */
+&vreg_l1a_1p225 { qcom,sleep-load-microamp = <0>; };
+&vreg_l8a_1p8 { qcom,sleep-load-microamp = <0>; };
+&vreg_l10a_1p8 { qcom,sleep-load-microamp = <0>; };
+&vreg_l11a_1p8 { qcom,sleep-load-microamp = <0>; };
+&vreg_l13a_1p8 { qcom,sleep-load-microamp = <0>; };
+&vreg_l1b_0p925 { qcom,sleep-load-microamp = <0>; };
+&vreg_l3b_3p3 { qcom,sleep-load-microamp = <0>; };
+&vreg_l4b_2p95 { qcom,sleep-load-microamp = <0>; };
+&vreg_l7b_3p125 { qcom,sleep-load-microamp = <0>; };
+&vreg_l8b_3p0 { qcom,sleep-load-microamp = <0>; };

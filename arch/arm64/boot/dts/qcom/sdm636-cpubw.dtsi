@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Onyx Note Air CPU -> DDR floor (needs sdm636-cpufreq.dtsi and the
+ * qcom-cpufreq-hw DDR floor patch on this branch).
+ *
+ * Without icc sync_state (sdm660 had none before the sync_state patch) every NoC
+ * node sat at INT_MAX forever; with it, nothing votes for the CPU's DDR
+ * bandwidth (sdm660's consumers are the GPU, SDHCs, MDP, camss and venus), so
+ * DDR can drop to its minimum under CPU load. This is the stock Onyx floor
+ * (qcom,mincpubw + devfreq-cpufreq cpu-to-dev-map, MB/s -> kBps), an
+ * active-only vote (the driver tags the path), so it never holds the RPM sleep
+ * set. Stock numbering is swapped: its cpu0-3 = silver = our cpu4-7.
+ *   silver: <= 633.6 MHz 762 MB/s, <= 1401.6 MHz 1571 MB/s
+ *   gold:   <= 1113.6 MHz 762 MB/s, 1401.6 MHz 2086 MB/s
+ * Stock's memlat monitors (latency-bound load raises the vote further) are
+ * not ported.
+ *
+ * opp-avg-kBps carries this same stock floor on every OPP: the driver's
+ * ddr_table=stock selects it at runtime (NA1 power-saver), so it stays
+ * exact when sdm636-cpubw-max.dtsi raises the peaks (= ddr_table=cmax).
+ */
+
+&cpu0 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu1 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu2 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu3 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu4 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu5 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu6 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+&cpu7 { interconnects = <&gnoc MASTER_APSS_PROC &bimc SLAVE_EBI>; };
+
+&cpu4_opp_table {
+	opp-300000000 { opp-peak-kBps = <762000>; opp-avg-kBps = <762000>; };
+	opp-633600000 { opp-peak-kBps = <762000>; opp-avg-kBps = <762000>; };
+	opp-902400000 { opp-peak-kBps = <1571000>; opp-avg-kBps = <1571000>; };
+	opp-1113600000 { opp-peak-kBps = <1571000>; opp-avg-kBps = <1571000>; };
+	opp-1401600000 { opp-peak-kBps = <1571000>; opp-avg-kBps = <1571000>; };
+};
+
+&cpu0_opp_table {
+	opp-300000000 { opp-peak-kBps = <762000>; opp-avg-kBps = <762000>; };
+	opp-1113600000 { opp-peak-kBps = <762000>; opp-avg-kBps = <762000>; };
+	opp-1401600000 { opp-peak-kBps = <2086000>; opp-avg-kBps = <2086000>; };
+};

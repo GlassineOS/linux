@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Onyx Note Air per-process GPU pagetables: stage 1 of the switch.
+ * Not included by default: include it from the board DTS to try it.
+ *
+ * The property makes arm-smmu-qcom (the TTBR1 opt-in) give the GPU's context bank
+ * the TTBR1 split that upstream withholds from the sdm630 GPU SMMU: the kernel
+ * VM moves to TTBR1 (GPU addresses with bit 48 set) and TTBR0 is free for one
+ * pagetable per process. Nothing else changes until stage 2, the kernel
+ * command line msm.a5xx_pp_pgtables=1 (drm/msm/a5xx), which hands every DRM
+ * file its own pagetable and switches TTBR0 from the ring.
+ *
+ * Needs the GPU SMMU's upstream bus to be 49 bits wide ("Stage-1: 48-bit VA"
+ * in the kgsl_smmu probe line, UBS id 5): with a narrower bus the sign
+ * extension bit is not bit 48 and nothing in TTBR1 is reachable (every GPU
+ * access faults, the desktop falls back to the CPU). Stage 0 reads the line.
+ */
+
+&kgsl_smmu {
+	na1,adreno-ttbr1;
+};
