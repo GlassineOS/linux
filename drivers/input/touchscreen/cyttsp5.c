@@ -534,6 +534,19 @@ static int cyttsp5_get_sysinfo_regs(struct cyttsp5 *ts)
 	scd->len_x = get_unaligned_le16(&scd_dev->len_x);
 	scd->len_y = get_unaligned_le16(&scd_dev->len_y);
 
+	/* NA1 (Onyx Note Air): log what the controller reports. On NA1 every
+	 * report failed the "Num touch err" check with n=1, i.e. max_tch
+	 * came out 0; fall back so touches get through. */
+	dev_info(ts->dev, "sysinfo: max_tch=%u res=%ux%u max_z=%u len=%ux%u\n",
+		 scd->max_tch, scd->res_x, scd->res_y, scd->max_z,
+		 scd->len_x, scd->len_y);
+	print_hex_dump(KERN_INFO, "cyttsp5 sensing: ", DUMP_PREFIX_OFFSET, 16, 1,
+		       scd_dev, sizeof(*scd_dev), false);
+	if (!scd->max_tch) {
+		scd->max_tch = 10;
+		dev_warn(ts->dev, "max_tch 0 from firmware, using %u\n", scd->max_tch);
+	}
+
 	return 0;
 }
 
