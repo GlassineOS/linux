@@ -695,6 +695,14 @@ config DRM_PANEL_NOVATEK_NT36536
 	  display panels, such as the one found in the LENOVO Legion Y700
 	  Gen4.
 
+config DRM_PANEL_ONYX_NA1_LINK
+	tristate "Onyx Boox Note Air e-ink DSI wire link"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	help
+	  The raw 285x1423 RGB888 DSI command-mode link of the Onyx Boox
+	  Note Air e-ink panel (software TCON through a TC358762 bridge).
+
 config DRM_PANEL_NOVATEK_NT36672A
 	tristate "Novatek NT36672A DSI panel"
 	depends on GPIOLIB
