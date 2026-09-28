@@ -163,7 +163,7 @@ int cpr_find_initial_corner(struct device *dev, struct clk *cpu_clk,
 			    struct corner *corners, int num_corners)
 {
 	unsigned long rate;
-	struct corner *iter, *corner;
+	struct corner *iter, *corner = NULL;
 	const struct corner *end;
 	unsigned int i = 0;
 
@@ -205,7 +205,7 @@ int cpr_find_initial_corner(struct device *dev, struct clk *cpu_clk,
 
 	dev_dbg(dev, "boot up perf state: %u\n", i);
 
-	return 0;
+	return corner - corners;
 }
 EXPORT_SYMBOL_GPL(cpr_find_initial_corner);
 
@@ -226,39 +226,32 @@ unsigned int cpr_get_fuse_corner(struct dev_pm_opp *opp, u32 tid)
 EXPORT_SYMBOL_GPL(cpr_get_fuse_corner);
 
 u64 cpr_get_opp_hz_for_req(struct dev_pm_opp *ref,
-				     struct device *cpu_dev)
+			    struct device *cpu_dev)
 {
-	u64 rate = 0;
-	struct device_node *ref_np;
-	struct device_node *desc_np;
-	struct device_node *child_np = NULL;
-	struct device_node *child_req_np = NULL;
+	struct device_node *ref_np __free(device_node) = NULL;
+	struct device_node *desc_np __free(device_node) =
+		dev_pm_opp_of_get_opp_desc_node(cpu_dev);
 
-	desc_np = dev_pm_opp_of_get_opp_desc_node(cpu_dev);
 	if (!desc_np)
 		return 0;
 
 	ref_np = dev_pm_opp_get_of_node(ref);
 	if (!ref_np)
-		goto out_ref;
+		return 0;
 
-	for_each_available_child_of_node(desc_np, child_np) {
-		child_req_np = of_parse_phandle(child_np, "required-opps", 0);
+	for_each_available_child_of_node_scoped(desc_np, child_np) {
+		struct device_node *child_req_np __free(device_node) =
+			of_parse_phandle(child_np, "required-opps", 0);
 
-		if (child_np && child_req_np == ref_np) {
+		if (child_req_np == ref_np) {
+			u64 rate = 0;
+
 			of_property_read_u64(child_np, "opp-hz", &rate);
-			goto out;
+			return rate;
 		}
 	}
 
-out:
-	of_node_put(child_req_np);
-	of_node_put(child_np);
-	of_node_put(ref_np);
-out_ref:
-	of_node_put(desc_np);
-
-	return rate;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(cpr_get_opp_hz_for_req);
 
@@ -269,7 +262,7 @@ int cpr_calculate_scaling(struct device *dev,
 {
 	u32 quot_diff = 0;
 	u64 freq_diff;
-	int scaling;
+	u32 scaling;
 	const struct fuse_corner *fuse, *prev_fuse;
 	int ret;
 
@@ -284,14 +277,23 @@ int cpr_calculate_scaling(struct device *dev,
 		quot_diff *= fdata->quot_offset_scale;
 		quot_diff += fdata->quot_offset_adjust;
 	} else {
-		quot_diff = fuse->quot - prev_fuse->quot;
+		/* Target quotients must never descend: clamp to zero */
+		quot_diff = max(fuse->quot - prev_fuse->quot, 0);
+	}
+
+	if (fuse->max_freq <= prev_fuse->max_freq) {
+		dev_err(dev, "fuse corner fmax not ascending: %llu <= %llu\n",
+			fuse->max_freq, prev_fuse->max_freq);
+		return -EINVAL;
 	}
 
 	freq_diff = fuse->max_freq - prev_fuse->max_freq;
 	freq_diff = div_u64(freq_diff, 1000000); /* Convert to MHz */
-	scaling = 1000 * quot_diff;
-	do_div(scaling, freq_diff);
-	return min(scaling, fdata->max_quot_scale);
+	if (!freq_diff)
+		return -EINVAL;
+
+	scaling = div64_u64(1000ULL * quot_diff, freq_diff);
+	return min_t(int, scaling, fdata->max_quot_scale);
 }
 EXPORT_SYMBOL_GPL(cpr_calculate_scaling);
 
