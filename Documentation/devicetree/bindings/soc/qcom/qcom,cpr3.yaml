@@ -26,6 +26,7 @@ properties:
           - enum:
               - qcom,msm8998-cprh
               - qcom,sdm630-cprh
+              - qcom,sdm660-cprh
           - const: qcom,cprh
 
   reg:
@@ -52,10 +53,26 @@ properties:
 
   nvmem-cells:
     description: Cells containing the fuse corners and revision data
-    maxItems: 32
+    minItems: 1
+    maxItems: 40
 
   nvmem-cell-names:
-    maxItems: 32
+    minItems: 1
+    maxItems: 40
+
+  qcom,cpr-open-loop-only:
+    type: boolean
+    description:
+      Program the CPR-hardened controller with closed-loop operation
+      disabled on every corner and with the floor voltage equal to the
+      open-loop voltage, so that the voltage never goes below the fused
+      open-loop value. Meant for bring-up and validation.
+
+  qcom,cpr-expected-speed-bin:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Speed bin the CPU OPP tables were written for. If the fused speed
+      bin differs, the driver refuses to probe.
 
   operating-points-v2: true
 
@@ -116,6 +133,63 @@ allOf:
             - const: cpr1_ring_osc2
             - const: cpr1_ring_osc3
             - const: cpr1_ring_osc4
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - qcom,sdm660-cprh
+    then:
+      properties:
+        nvmem-cell-names:
+          items:
+            - const: cpr_speed_bin
+            - const: cpr_fuse_revision
+            - const: cpr0_quotient1
+            - const: cpr0_quotient2
+            - const: cpr0_quotient3
+            - const: cpr0_quotient4
+            - const: cpr0_quotient5
+            - const: cpr0_quotient_offset2
+            - const: cpr0_quotient_offset3
+            - const: cpr0_quotient_offset4
+            - const: cpr0_quotient_offset5
+            - const: cpr0_init_voltage1
+            - const: cpr0_init_voltage2
+            - const: cpr0_init_voltage3
+            - const: cpr0_init_voltage4
+            - const: cpr0_init_voltage5
+            - const: cpr0_ring_osc1
+            - const: cpr0_ring_osc2
+            - const: cpr0_ring_osc3
+            - const: cpr0_ring_osc4
+            - const: cpr0_ring_osc5
+            - const: cpr1_quotient1
+            - const: cpr1_quotient2
+            - const: cpr1_quotient3
+            - const: cpr1_quotient4
+            - const: cpr1_quotient5
+            - const: cpr1_quotient_offset2
+            - const: cpr1_quotient_offset3
+            - const: cpr1_quotient_offset4
+            - const: cpr1_quotient_offset5
+            - const: cpr1_init_voltage1
+            - const: cpr1_init_voltage2
+            - const: cpr1_init_voltage3
+            - const: cpr1_init_voltage4
+            - const: cpr1_init_voltage5
+            - const: cpr1_ring_osc1
+            - const: cpr1_ring_osc2
+            - const: cpr1_ring_osc3
+            - const: cpr1_ring_osc4
+            - const: cpr1_ring_osc5
+    else:
+      properties:
+        nvmem-cells:
+          maxItems: 32
+        nvmem-cell-names:
+          maxItems: 32
 
 examples:
   - |
@@ -191,22 +265,22 @@ examples:
         cprh_opp1: opp-1 {
             opp-level = <1>;
             qcom,opp-fuse-level = <1>;
-            qcom,opp-cloop-vadj = <0>;
-            qcom,opp-oloop-vadj = <0>;
+            qcom,opp-cloop-vadj = <0 0>;
+            qcom,opp-oloop-vadj = <0 0>;
         };
 
         cprh_opp2: opp-2 {
             opp-level = <2>;
             qcom,opp-fuse-level = <2>;
-            qcom,opp-cloop-vadj = <0>;
-            qcom,opp-oloop-vadj = <0>;
+            qcom,opp-cloop-vadj = <0 0>;
+            qcom,opp-oloop-vadj = <0 0>;
         };
 
         cprh_opp3: opp-3 {
             opp-level = <3>;
             qcom,opp-fuse-level = <2 3>;
-            qcom,opp-cloop-vadj = <0>;
-            qcom,opp-oloop-vadj = <0>;
+            qcom,opp-cloop-vadj = <0 0>;
+            qcom,opp-oloop-vadj = <0 0>;
         };
     };
 
