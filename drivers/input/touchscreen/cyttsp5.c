@@ -550,10 +550,14 @@ static int cyttsp5_get_sysinfo_regs(struct cyttsp5 *ts)
 	return 0;
 }
 
-static int cyttsp5_hid_output_get_sysinfo(struct cyttsp5 *ts)
+static int cyttsp5_hid_output_get_sysinfo_once(struct cyttsp5 *ts)
 {
 	int rc;
 	u8 cmd[HID_OUTPUT_GET_SYSINFO_SIZE];
+
+	/* NA1: drop a completion left by an earlier empty (size 0) frame */
+	reinit_completion(&ts->cmd_done);
+	memset(ts->response_buf, 0, HID_SYSINFO_BTN_OFFSET + 1);
 
 	/* HI bytes of Output register address */
 	put_unaligned_le16(HID_OUTPUT_GET_SYSINFO_SIZE, cmd);
@@ -572,17 +576,46 @@ static int cyttsp5_hid_output_get_sysinfo(struct cyttsp5 *ts)
 						msecs_to_jiffies(CY_HID_OUTPUT_GET_SYSINFO_TIMEOUT_MS));
 	if (rc <= 0) {
 		dev_err(ts->dev, "HID output cmd execution timed out\n");
-		rc = -ETIMEDOUT;
-		return rc;
+		return -EAGAIN;		/* NA1: asked again, see below */
 	}
 
 	rc = cyttsp5_validate_cmd_response(ts, HID_OUTPUT_GET_SYSINFO);
 	if (rc) {
+		/*
+		 * NA1: right after power-up the controller sometimes answers
+		 * the first GET_SYSINFO with an error status (ERROR:4); the
+		 * probe then failed (-EPROTO) and touch stayed dead until a
+		 * rebind, which always worked. Ask again.
+		 */
 		dev_err(ts->dev, "Validation of the response failed\n");
-		return rc;
+		return -EAGAIN;
 	}
 
+	/*
+	 * NA1: an empty frame (size 0) completes cmd_done too and passes the
+	 * validation, leaving an all-zero sysinfo (res 0x0 -> ABS max -1,
+	 * na1-touchd's uinput device is refused). Ask again in that case.
+	 */
+	if (get_unaligned_le16(&ts->response_buf[0]) <= HID_SYSINFO_BTN_OFFSET)
+		return -EAGAIN;
+
 	return cyttsp5_get_sysinfo_regs(ts);
+}
+
+static int cyttsp5_hid_output_get_sysinfo(struct cyttsp5 *ts)
+{
+	int rc, i;
+
+	for (i = 0; i < 5; i++) {
+		rc = cyttsp5_hid_output_get_sysinfo_once(ts);
+		if (rc != -EAGAIN)
+			return rc;
+		dev_warn(ts->dev, "no valid sysinfo response, retrying (%d)\n", i + 1);
+		msleep(100);
+	}
+
+	dev_err(ts->dev, "no sysinfo after %d tries\n", i);
+	return -EIO;
 }
 
 static int cyttsp5_power_control(struct cyttsp5 *ts, bool on)
