@@ -692,6 +692,15 @@ config SND_SOC_AW88166
 	  digital Smart K audio amplifier with sound quality
 	  enhancement algorithms and speaker protection.
 
+config SND_SOC_AW88194
+	tristate "Soc Audio for awinic aw88194"
+	depends on I2C
+	select REGMAP_I2C
+	select GPIOLIB
+	help
+	  This option enables support for the aw88194 Smart PA (chip id
+	  0x1806), the speaker amp of the Onyx Boox Note Air.
+
 config SND_SOC_AW88261
 	tristate "Soc Audio for awinic aw88261"
 	depends on I2C
