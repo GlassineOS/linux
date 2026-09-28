@@ -1242,6 +1242,7 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 {
 	struct q6afe *afe = dev_get_drvdata(dev->parent);
 	struct afe_clk_set cset = {0,};
+	int ret, tries;
 
 	cset.clk_set_minor_version = AFE_API_VERSION_CLOCK_SET;
 	cset.clk_id = clk_id;
@@ -1250,9 +1251,40 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 	cset.clk_root = clk_root;
 	cset.enable = !!freq;
 
-	return q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
-			       AFE_MODULE_CLOCK_SET, sizeof(cset),
-			       AFE_CLK_TOKEN);
+	/*
+	 * The SDM660 ADSP (Onyx Note Air) rejects CLOCK_SET with error 0x16 for
+	 * a while after it boots; the digital codec's probe asks for its MCLK
+	 * right then and fails for good (no sound card). The same request
+	 * succeeds once the DSP has settled: retry for up to 10 s.
+	 *
+	 * A rejected enable still counts inside the DSP: after a boot with
+	 * retries, releasing the clock never let the ADSP sleep again (its RPM
+	 * master stayed active, no vlow/vmin), while a first enable after the
+	 * DSP settled pairs cleanly with its disable. So every rejected enable
+	 * is followed by a disable of the same clock before the next try.
+	 */
+	for (tries = 0; ; tries++) {
+		ret = q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
+				      AFE_MODULE_CLOCK_SET, sizeof(cset),
+				      AFE_CLK_TOKEN);
+		if (ret != -EINVAL)
+			break;
+		if (cset.enable) {
+			struct afe_clk_set off = cset;
+
+			off.enable = 0;
+			q6afe_set_param(afe, NULL, &off, AFE_PARAM_ID_CLOCK_SET,
+					AFE_MODULE_CLOCK_SET, sizeof(off),
+					AFE_CLK_TOKEN);
+		}
+		if (tries >= 40)
+			break;
+		msleep(250);
+	}
+	if (tries)
+		dev_info(dev, "clock 0x%x set after %d retries: %d\n", clk_id, tries, ret);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6afe_set_lpass_clock);
 
