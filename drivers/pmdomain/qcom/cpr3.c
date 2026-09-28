@@ -225,6 +225,9 @@ struct cpr_thread_desc {
  * @reduce_to_fuse_uV:     Reduce corner max volts (if higher) to fuse ceiling
  * @reduce_to_corner_uV:   Reduce corner max volts (if higher) to corner ceil.
  * @hw_closed_loop_en:     Enable CPR HW Closed-Loop voltage auto-adjustment
+ * @no_per_ro_kv_margin:   Do not enable per-RO KV margin adjustment
+ * @reset_step_quot_loop_en: Reset step quotient loop on all threads
+ * @cprh_pre_4p5:          CPRh is known to use the pre-v4.5 register layout
  */
 struct cpr_desc {
 	enum cpr_type		cpr_type;
@@ -256,6 +259,9 @@ struct cpr_desc {
 	bool reduce_to_fuse_uV;
 	bool reduce_to_corner_uV;
 	bool hw_closed_loop_en;
+	bool no_per_ro_kv_margin;
+	bool reset_step_quot_loop_en;
+	bool cprh_pre_4p5;
 };
 
 struct cpr_drv;
@@ -299,6 +305,7 @@ struct cpr_drv {
 	int			extra_corners;
 	unsigned int		vreg_step;
 	bool			enabled;
+	bool			open_loop_only;
 
 	struct cpr_thread	*threads;
 	struct genpd_onecell_data cell_data;
@@ -900,7 +907,7 @@ static int cpr_configure(struct cpr_thread *thread)
 	/* HW Closed-loop control */
 	cpr_masked_write(thread, CPR4_REG_MARGIN_ADJ_CTL,
 			 CPR4_MARGIN_ADJ_HW_CLOSED_LOOP_EN,
-			 desc->hw_closed_loop_en ?
+			 (desc->hw_closed_loop_en && !drv->open_loop_only) ?
 			 CPR4_MARGIN_ADJ_HW_CLOSED_LOOP_EN : 0);
 
 	/* Additional configuration for CPR4 and beyond */
@@ -914,6 +921,11 @@ static int cpr_configure(struct cpr_thread *thread)
 				 CPR4_CPR_MASK_THREAD_RO_MASK4THREAD_MASK,
 				 CPR4_CPR_MASK_THREAD_DISABLE_THREAD |
 				 CPR4_CPR_MASK_THREAD_RO_MASK4THREAD_MASK);
+
+	if (desc->reset_step_quot_loop_en)
+		cpr_masked_write(thread, CPR4_REG_MISC,
+				 CPR4_MISC_RESET_STEP_QUOT_LOOP_EN,
+				 CPR4_MISC_RESET_STEP_QUOT_LOOP_EN);
 
 	if (tdesc->hw_tid > 0)
 		cpr_masked_write(thread, CPR4_REG_MISC,
@@ -940,7 +952,8 @@ static int cpr_configure(struct cpr_thread *thread)
 
 	cpr_masked_write(thread, CPR4_REG_MARGIN_ADJ_CTL,
 			 CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN,
-			 CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN);
+			 desc->no_per_ro_kv_margin ?
+			 0 : CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN);
 
 	if (tdesc->hw_tid > 0)
 		cpr_masked_write(thread, CPR4_REG_CPR_TIMER_CLAMP,
@@ -1102,9 +1115,9 @@ skip_pvs_restrict:
 		if (fuse->uV < prev_fuse->uV)
 			fuse->uV = prev_fuse->uV;
 		prev_fuse = fuse;
-		dev_dbg(drv->dev, "fuse corner %d: [%d %d %d] RO%u quot %d\n",
-			i, fuse->min_uV, fuse->uV, fuse->max_uV,
-			fuse->ring_osc_idx, fuse->quot);
+		dev_info(drv->dev, "thread %d fuse corner %d: [%d %d %d] uV RO%u quot %d\n",
+			 thread->id, i, fuse->min_uV, fuse->uV, fuse->max_uV,
+			 fuse->ring_osc_idx, fuse->quot);
 
 		/* Check if constraints are valid */
 		if (fuse->uV < fuse->min_uV || fuse->uV > fuse->max_uV) {
@@ -1227,6 +1240,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 
 		freq = cpr_get_opp_hz_for_req(opp, thread->attached_cpu_dev);
 		if (!freq) {
+			dev_pm_opp_put(opp);
 			thread->num_corners = max(level - 1, 0);
 			end = &thread->corners[thread->num_corners - 1];
 			break;
@@ -1254,7 +1268,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 		 * Make sure that the frequencies in the table are in ascending
 		 * order, as this is critical for the algorithm to work.
 		 */
-		if (cdata[level - 2].freq > freq) {
+		if (level > 1 && cdata[level - 2].freq > freq) {
 			dev_err(drv->dev, "Frequency table not in ascending order.\n");
 			return -EINVAL;
 		}
@@ -1397,6 +1411,16 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 				     corner->min_uV);
 
 		/*
+		 * Open-loop only: the CPRh must never go below the open-loop
+		 * voltage, so pin the floor to it and disable closed-loop
+		 * operation for this corner.
+		 */
+		if (drv->open_loop_only) {
+			corner->min_uV = corner->uV;
+			corner->is_open_loop = true;
+		}
+
+		/*
 		 * Adjust per-corner floor and ceiling voltages so that
 		 * they do not overlap the memory Array Power Mux (APM)
 		 * nor the Memory Accelerator (MEM-ACC) threshold voltages.
@@ -1410,9 +1434,21 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 					     0, drv->vreg_step);
 
 		prev_corner = corner;
-		dev_dbg(drv->dev, "corner %d: [%d %d %d] scaling %d quot %d\n", i,
-			corner->min_uV, corner->uV, corner->max_uV, scaling,
-			fuse->quot - corner->quot_adjust);
+		dev_info(drv->dev, "thread %d corner %d: %llu Hz fuse %u [floor %d open-loop %d ceiling %d] uV quot %d%s\n",
+			 thread->id, i, corner->freq, fnum, corner->min_uV,
+			 corner->uV, corner->max_uV,
+			 fuse->quot - corner->quot_adjust,
+			 corner->is_open_loop ? " (CL disabled)" : "");
+
+		/* Safety net: never program anything above the SoC ceiling */
+		if (corner->uV > desc->cpr_max_voltage ||
+		    corner->max_uV > desc->cpr_max_voltage ||
+		    corner->min_uV > corner->uV ||
+		    corner->uV > corner->max_uV) {
+			dev_err(drv->dev, "thread %d corner %d: bad voltages, refusing\n",
+				thread->id, i);
+			return -EINVAL;
+		}
 	}
 
 	/* Additional setup for CPRh only */
@@ -1652,7 +1688,13 @@ static int cpr3_init_parameters(struct cpr_drv *drv)
 	 *       check this only on the first controller/thread.
 	 */
 	drv->cpr_hw_rev = cpr_read(&drv->threads[0], CPR3_REG_CPR_VERSION);
-	dev_dbg(drv->dev, "CPR hardware revision: 0x%x\n", drv->cpr_hw_rev);
+	dev_info(drv->dev, "CPR hardware revision: 0x%x\n", drv->cpr_hw_rev);
+
+	/* Never guess the corner/control register layout on a known SoC */
+	if (desc->cprh_pre_4p5 && drv->cpr_hw_rev >= CPRH_CPR_VERSION_4P5) {
+		dev_err(drv->dev, "unexpected CPRh revision 0x%x\n", drv->cpr_hw_rev);
+		return -ENODEV;
+	}
 
 	if (drv->cpr_hw_rev >= CPRH_CPR_VERSION_4P5) {
 		drv->reg_corner = 0x3500;
@@ -2141,6 +2183,248 @@ static const struct cpr_acc_desc sdm630_cpr_acc_desc = {
 	.cpr_desc = &sdm630_cpr_desc,
 };
 
+/*
+ * SDM660/SDM636 KBSS CPRh, values taken from the downstream
+ * cprh-kbss-regulator.c + sdm660-regulator.dtsi and cross-checked against
+ * the device tree of the Onyx Boox Note Air 1 (SDM636, speed bin 3):
+ *  - apc0 (0x179c8000) = Power cluster (Silver, Kryo 260 Silver, CPU4-7)
+ *  - apc1 (0x179c4000) = Performance cluster (Gold, CPU0-3)
+ * Fuse corners: Silver LowSVS/SVS/SVS+/NOM/TURBO_L1
+ *               Gold   SVS/SVS+/NOM/TURBO/TURBO_L2
+ * ref_uV/max_uV/min_uV are the downstream reference, ceiling and floor
+ * voltages (the floor is the one of the fmax corner of each fuse corner),
+ * volt_oloop_adjust/volt_cloop_adjust are the per-fuse-corner open/closed
+ * loop fuse adjustments found in the stock device tree.
+ * Downstream has no interpolation limits: set generous scale limits.
+ */
+static const int sdm660_gold_scaling_factor[][CPR3_RO_COUNT] = {
+	/* Same RO factors for all fuse corners */
+	{
+		4040, 4230,    0, 2210, 2560, 2450, 2230, 2220,
+		2410, 2300, 2560, 2470, 1600, 3120, 2620, 2280,
+	}
+};
+
+static const struct cpr_thread_desc sdm660_thread_silver = {
+	.controller_id = 0,
+	.hw_tid = 0,
+	.ro_scaling_factor = sdm630_silver_scaling_factor,
+	.ro_scaling_factor_common = true,
+	.sensor_range_start = 0,
+	.sensor_range_end = 6,
+	.init_voltage_step = 10000,
+	.init_voltage_width = 6,
+	.step_quot_init_min = 12,
+	.step_quot_init_max = 14,
+	.num_fuse_corners = 5,
+	.fuse_corner_data = (struct fuse_corner_data[]){
+		{
+			.ref_uV = 644000,
+			.max_uV = 724000,
+			.min_uV = 588000,
+			.range_uV = 32000,
+			.volt_cloop_adjust = -32000,
+			.volt_oloop_adjust = -4000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 724000,
+			.max_uV = 724000,
+			.min_uV = 596000,
+			.range_uV = 32000,
+			.volt_cloop_adjust = -30000,
+			.volt_oloop_adjust = 4000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 788000,
+			.max_uV = 788000,
+			.min_uV = 652000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = -29000,
+			.volt_oloop_adjust = 7000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 868000,
+			.max_uV = 868000,
+			.min_uV = 712000,
+			.range_uV = 44000,
+			.volt_cloop_adjust = -23000,
+			.volt_oloop_adjust = 19000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 1068000,
+			.max_uV = 1068000,
+			.min_uV = 844000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = -21000,
+			.volt_oloop_adjust = -8000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+	},
+};
+
+static const struct cpr_thread_desc sdm660_thread_gold = {
+	.controller_id = 1,
+	.hw_tid = 0,
+	.ro_scaling_factor = sdm660_gold_scaling_factor,
+	.ro_scaling_factor_common = true,
+	.sensor_range_start = 0,
+	.sensor_range_end = 9,
+	.init_voltage_step = 10000,
+	.init_voltage_width = 6,
+	.step_quot_init_min = 12,
+	.step_quot_init_max = 14,
+	.num_fuse_corners = 5,
+	.fuse_corner_data = (struct fuse_corner_data[]){
+		{
+			.ref_uV = 724000,
+			.max_uV = 724000,
+			.min_uV = 596000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = -22000,
+			.volt_oloop_adjust = 16000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 788000,
+			.max_uV = 788000,
+			.min_uV = 652000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = -9000,
+			.volt_oloop_adjust = 27000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 868000,
+			.max_uV = 868000,
+			.min_uV = 712000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = -7000,
+			.volt_oloop_adjust = 39000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 988000,
+			.max_uV = 988000,
+			.min_uV = 784000,
+			.range_uV = 66000,
+			.volt_cloop_adjust = -2000,
+			.volt_oloop_adjust = 39000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+		{
+			.ref_uV = 1068000,
+			.max_uV = 1068000,
+			.min_uV = 844000,
+			.range_uV = 40000,
+			.volt_cloop_adjust = 11000,
+			.volt_oloop_adjust = 20000,
+			.max_volt_scale = 2000,
+			.max_quot_scale = 2000,
+			.quot_offset = 0,
+			.quot_scale = 1,
+			.quot_adjust = 0,
+			.quot_offset_scale = 5,
+			.quot_offset_adjust = 0,
+		},
+	},
+};
+
+static const struct cpr_desc sdm660_cpr_desc = {
+	.cpr_type = CTRL_TYPE_CPRH,
+	.num_threads = 2,
+	.apm_threshold = 872000,
+	.apm_crossover = 872000,
+	.apm_hysteresis = 20000,
+	.cpr_base_voltage = 400000,
+	.cpr_max_voltage = 1068000,
+	.timer_delay_us = 5000,
+	.timer_cons_up = 0,
+	.timer_cons_down = 2,
+	.up_threshold = 2,
+	.down_threshold = 2,
+	.idle_clocks = 15,
+	.count_mode = CPR3_CPR_CTL_COUNT_MODE_ALL_AT_ONCE_MIN,
+	.count_repeat = 14,
+	.gcnt_us = 1,
+	.vreg_step_fixed = 4000,
+	.vreg_step_up_limit = 1,
+	.vreg_step_down_limit = 1,
+	/* Raw counts at 19.2MHz: 1760ns settling, 1042ns / 4 switch delay */
+	.vdd_settle_time_us = 33,
+	.corner_settle_time_us = 5,
+	.reduce_to_corner_uV = true,
+	.hw_closed_loop_en = true,
+	.no_per_ro_kv_margin = true,
+	.reset_step_quot_loop_en = true,
+	.cprh_pre_4p5 = true,
+	.threads = (const struct cpr_thread_desc *[]) {
+		&sdm660_thread_silver,
+		&sdm660_thread_gold,
+	},
+};
+
+static const struct cpr_acc_desc sdm660_cpr_acc_desc = {
+	.cpr_desc = &sdm660_cpr_desc,
+};
+
 static int cpr_power_off(struct generic_pm_domain *domain)
 {
 	struct cpr_thread *thread = container_of(domain, struct cpr_thread, pd);
@@ -2467,7 +2751,7 @@ static int cpr_thread_init(struct cpr_drv *drv, int tid)
 
 fail:
 	/* Unregister all previously registered genpds */
-	for (i = tid - pd_registered; i >= 0; i--)
+	for (i = tid - !pd_registered; i >= 0; i--)
 		pm_genpd_remove(&drv->threads[i].pd);
 
 	return ret;
@@ -2615,6 +2899,11 @@ static int cpr_probe(struct platform_device *pdev)
 	 * initialized after attaching to the power domain,
 	 * since it depends on the CPU's OPP table.
 	 */
+	drv->open_loop_only = of_property_read_bool(dev->of_node,
+						    "qcom,cpr-open-loop-only");
+	if (drv->open_loop_only)
+		dev_info(dev, "open-loop only: closed-loop voltage reduction disabled\n");
+
 	ret = nvmem_cell_read_variable_le_u32(dev, "cpr_fuse_revision", &drv->fusing_rev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Couldn't get revision fuse\n");
@@ -2622,6 +2911,19 @@ static int cpr_probe(struct platform_device *pdev)
 	ret = nvmem_cell_read_variable_le_u32(dev, "cpr_speed_bin", &drv->speed_bin);
 	if (ret)
 		return dev_err_probe(dev, ret, "Couldn't get speedbin fuse\n");
+
+	dev_info(dev, "speed bin %u, fuse revision %u\n",
+		 drv->speed_bin, drv->fusing_rev);
+
+	/*
+	 * The CPU OPP tables (frequencies, PLL overrides) are only valid for
+	 * one speed bin: refuse to program anything on a different part.
+	 */
+	if (!of_property_read_u32(dev->of_node, "qcom,cpr-expected-speed-bin", &i) &&
+	    i != drv->speed_bin)
+		return dev_err_probe(dev, -ENODEV,
+				     "speed bin %u does not match expected %u\n",
+				     drv->speed_bin, i);
 
 	/*
 	 * Some SoCs require extra corners for MEM-ACC or APM: if
@@ -2668,7 +2970,7 @@ static int cpr_probe(struct platform_device *pdev)
 
 unreg_genpd:
 	/* Clean up genpds */
-	for (i = desc->num_threads - 1; i >= 0; i--)
+	for (i = desc->num_threads; i-- > 0; )
 		pm_genpd_remove(&drv->threads[i].pd);
 
 	return dev_err_probe(dev, ret, "Error initializing CPR\n");
@@ -2693,6 +2995,7 @@ static void cpr_remove(struct platform_device *pdev)
 static const struct of_device_id cpr3_match_table[] = {
 	{ .compatible = "qcom,msm8998-cprh", .data = &msm8998_cpr_acc_desc },
 	{ .compatible = "qcom,sdm630-cprh", .data = &sdm630_cpr_acc_desc },
+	{ .compatible = "qcom,sdm660-cprh", .data = &sdm660_cpr_acc_desc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, cpr3_match_table);
