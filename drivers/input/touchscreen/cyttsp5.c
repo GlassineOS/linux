@@ -392,6 +392,13 @@ static int cyttsp5_setup_input_device(struct device *dev)
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, MAX_AREA, 0, 0);
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MINOR, 0, MAX_AREA, 0, 0);
 
+	/*
+	 * NA1: parse touchscreen-inverted-* only now. Parsed before the axes
+	 * had their ranges, prop.max_y was 0 and inverted-y reported 0 - y
+	 * (negative y, every tap at the edge after X's clamping).
+	 */
+	touchscreen_parse_properties(ts->input, true, &ts->prop);
+
 	error = input_mt_init_slots(ts->input, si->tch_abs[CY_TCH_T].max,
 				    INPUT_MT_DROP_UNUSED | INPUT_MT_DIRECT);
 	if (error)
@@ -948,8 +955,6 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 		dev_err(ts->dev, "Error while parsing dts %d\n", error);
 		return error;
 	}
-
-	touchscreen_parse_properties(ts->input, true, &ts->prop);
 
 	__set_bit(EV_KEY, ts->input->evbit);
 	for (i = 0; i < si->num_btns; i++)
