@@ -248,6 +248,7 @@ struct qcom_cpufreq_hw_params {
  * @lut_row_size:          Lookup Table row size
  * @clk_hw_div:            Divider for "alternate" OSM clock-source
  * @uses_tz:               OSM already set-up and protected by TrustZone
+ * @num_freq_domains:      Number of frequency domains (0 = count reg entries)
  * @setup_regs:            Register offsets for OSM setup
  */
 
@@ -266,6 +267,7 @@ struct qcom_cpufreq_soc_data {
 	u8 lut_row_size;
 	u8 clk_hw_div;
 	bool uses_tz;
+	u8 num_freq_domains;
 	const struct qcom_cpufreq_soc_setup_data setup_regs;
 	const struct qcom_cpufreq_soc_acd_data acd_data;
 };
@@ -285,6 +287,10 @@ struct qcom_cpufreq_data {
 	struct cpufreq_policy *policy;
 	struct clk_hw cpu_clk;
 
+	/* CPRh genpd virtual device, kept attached for the driver lifetime */
+	struct device *pd_dev;
+	bool osm_programmed;
+
 	bool per_core_dcvs;
 };
 
@@ -293,7 +299,6 @@ static struct {
 	const struct qcom_cpufreq_soc_data *soc_data;
 } qcom_cpufreq;
 
-static const char *cprh_genpd_names[] = { "perf", NULL };
 static unsigned long cpu_hw_rate, xo_rate;
 static bool icc_scaling_enabled;
 
@@ -384,7 +389,11 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
 			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
 
-	if (icc_scaling_enabled)
+	/*
+	 * When the OSM is programmed by the OS, the voltage is managed by
+	 * the OSM and CPRh hardware: don't try to set required-opps here.
+	 */
+	if (icc_scaling_enabled && soc_data->uses_tz)
 		qcom_cpufreq_set_bw(policy, freq);
 
 	return 0;
@@ -514,37 +523,48 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 				   int *apm_vc, int *acc_vc, int cpu_count,
 				   u8 *num_entries)
 {
-	struct device **genpd_cpr_vdev;
 	struct platform_device *pdev = cpufreq_get_driver_data();
 	const struct qcom_cpufreq_soc_data *soc_data = qcom_cpufreq.soc_data;
 	struct device *dev = &pdev->dev;
 	struct cpr_ext_data *cpr_data;
 	struct dev_pm_opp *genpd_opp;
+	struct device *pd_dev;
 	unsigned long rate;
 	int apm_uV, acc_uV, i, gpd_opp_cnt, ret = 0;
 
-	ret = devm_pm_opp_attach_genpd(cpu_dev, cprh_genpd_names, &genpd_cpr_vdev);
-	if (ret)
-		return dev_err_probe(dev, ret, "Could not attach to pm_domain: %d\n", ret);
-
-	if (IS_ERR_OR_NULL(*genpd_cpr_vdev))
-		return dev_err_probe(dev, -EINVAL, "Got a NULL genpd vdev");
+	/*
+	 * Attach to the CPRh power domain: this makes the CPR driver
+	 * calculate the corner voltages, program them to the CPRh and
+	 * write them into the (shared) OPP table of the CPU.
+	 */
+	if (!data->pd_dev) {
+		pd_dev = dev_pm_domain_attach_by_name(cpu_dev, "perf");
+		if (IS_ERR(pd_dev))
+			return dev_err_probe(dev, PTR_ERR(pd_dev),
+					     "Could not attach to pm_domain\n");
+		if (!pd_dev)
+			return dev_err_probe(dev, -ENODEV, "No perf pm_domain\n");
+		data->pd_dev = pd_dev;
+	}
+	pd_dev = data->pd_dev;
 
 	/*
 	 * In the CPR3 driver we have assigned data to the genpd newly created
 	 * virtual device: this contains MEMACC and APM thresholds, as passing
 	 * them through OPPs would be an API abuse.
 	 */
-	cpr_data = dev_get_drvdata(*genpd_cpr_vdev);
+	cpr_data = dev_get_drvdata(pd_dev);
 	if (!cpr_data)
 		return dev_err_probe(dev, -ENODATA, "Cannot get CPR data\n");
 
 	/* Get the count of available OPPs coming from the power domain */
-	gpd_opp_cnt = dev_pm_opp_get_opp_count(cpu_dev);
+	gpd_opp_cnt = dev_pm_opp_get_opp_count(pd_dev);
 	if (gpd_opp_cnt < 2) {
-		ret = gpd_opp_cnt > 0 ? -EINVAL : gpd_opp_cnt;
+		ret = gpd_opp_cnt >= 0 ? -EINVAL : gpd_opp_cnt;
 		return dev_err_probe(dev, ret, "Got invalid number of OPPs\n");
 	}
+	if (gpd_opp_cnt > LUT_MAX_ENTRIES)
+		return dev_err_probe(dev, -EINVAL, "Too many OPPs: %d\n", gpd_opp_cnt);
 
 	/* If we get no APM voltage, the system is going to be unstable */
 	apm_uV = cpr_data->apm_threshold_uV;
@@ -572,10 +592,10 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 
 	*hw_tbl = devm_kmalloc_array(&pdev->dev, gpd_opp_cnt,
 				     sizeof(**hw_tbl), GFP_KERNEL);
-	if (!hw_tbl)
+	if (!*hw_tbl)
 		return -ENOMEM;
 
-	for (i = 0, rate = 1000; i <= gpd_opp_cnt ; rate++, i++) {
+	for (i = 0, rate = 1000; i < gpd_opp_cnt; rate++, i++) {
 		struct qcom_cpufreq_hw_params *entry = *hw_tbl + i;
 		struct device_node *np;
 		u32 pll_div, millivolts, f_src;
@@ -587,18 +607,21 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 		 * defined frequency, so we quit the loop gracefully without
 		 * signaling any error, as this is the expected behavior.
 		 */
-		genpd_opp = dev_pm_opp_find_freq_ceil(cpu_dev, &rate);
+		genpd_opp = dev_pm_opp_find_freq_ceil(pd_dev, &rate);
 		if (IS_ERR(genpd_opp))
 			break;
 
 		/* Get mandatory and optional properties from the OPP DT */
 		np = dev_pm_opp_get_of_node(genpd_opp);
-		if (!np)
+		if (!np) {
+			dev_pm_opp_put(genpd_opp);
 			return dev_err_probe(dev, -ENOENT, "Couldn't get OPP table");
+		}
 
 		if (of_property_read_u32(np, "qcom,pll-override",
 					 &entry->override_val)) {
 			of_node_put(np);
+			dev_pm_opp_put(genpd_opp);
 			return dev_err_probe(dev, -EINVAL, "Couldn't get qcom,pll-override\n");
 		}
 
@@ -623,6 +646,7 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 		if (millivolts < 150 || millivolts > 1400) {
 			dev_err(&pdev->dev,
 				"Read invalid voltage: %u.\n", millivolts);
+			dev_pm_opp_put(genpd_opp);
 			return -EINVAL;
 		}
 
@@ -653,10 +677,11 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 		 */
 		entry->freq_lut_val |= FIELD_PREP(LUT_PLL_DIV, pll_div);
 
-		dev_dbg(&pdev->dev,
-			"[%d] freq=0x%x volt=0x%x override=0x%x spare=0x%x\n",
-			i, entry->freq_lut_val, entry->volt_lut_val,
-			entry->override_val, entry->spare_val);
+		dev_info(cpu_dev,
+			 "OSM LUT[%d] %lu Hz %u mV: freq=0x%08x volt=0x%08x override=0x%08x spare=%u\n",
+			 i, rate, millivolts, entry->freq_lut_val,
+			 entry->volt_lut_val, entry->override_val,
+			 entry->spare_val);
 		dev_pm_opp_put(genpd_opp);
 		genpd_opp = NULL;
 	}
@@ -924,10 +949,20 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 		acc_idx++;
 	}
 
-	/* Sanity check: we *must* have two mem-acc crossovers (four values) */
-	if (acc_idx < SEQ_MEM_ACC_MAX_LEVELS - 1) {
-		dev_err(&pdev->dev, "Only found %i / 4 mem-acc crossover values", acc_idx + 1);
-		return -EINVAL;
+	/*
+	 * Less than two mem-acc crossovers (e.g. a frequency plan capped
+	 * below the highest mem-acc level): do exactly what the downstream
+	 * clk-cpu-osm driver does, which fills the missing crossovers with
+	 * virtual corners 0-1.
+	 */
+	if (acc_idx < SEQ_MEM_ACC_MAX_LEVELS) {
+		dev_info(&pdev->dev, "Found %d / 2 mem-acc crossovers\n", acc_idx / 2);
+		if (acc_idx == 0) {
+			acc_val[0] = 0;
+			acc_val[1] = 1;
+		}
+		acc_val[2] = 0;
+		acc_val[3] = 1;
 	}
 
 	/*
@@ -966,7 +1001,7 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 		if (ret)
 			return ret;
 	}
-	dev_dbg(cpu_dev, "Wrote MEM-ACC Pairs: [%u-%u] [%u-%u]\n",
+	dev_info(cpu_dev, "Wrote MEM-ACC Pairs: [%u-%u] [%u-%u]\n",
 		 acc_val[0], acc_val[1], acc_val[2], acc_val[3]);
 
 	/*
@@ -979,21 +1014,27 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 		dev_dbg(cpu_dev, "Cannot send memacc l_val\n");
 		return ret;
 	}
-	dev_dbg(cpu_dev, "MEM-ACC L-Val is %u\n", acc_lval);
+	dev_info(cpu_dev, "MEM-ACC L-Val is %u\n", acc_lval);
 
 	/*
 	 * Array Power Mux threshold level: the first virtual corner
 	 * that requires a switch sequence of the APM from MX to APC.
+	 * If no corner reaches the APM threshold, use the last possible
+	 * virtual corner (so that the switch never happens), like the
+	 * downstream driver does.
 	 */
-	if (apm_vc == INT_MAX)
+	if (apm_vc < 0 || apm_vc == INT_MAX)
 		apm_vc = LUT_MAX_ENTRIES - 1;
+
+	/* Only written if non-zero, as downstream does */
+	if (apm_vc)
+		writel(apm_vc, ddata->base + sregs->reg_seq1);
 
 	/*
 	 * APM crossover virtual corner refers to CPRh: there, the APM corner
 	 * is always appended to the table (so, at the end of it, right after
 	 * the cluster dvfs entries).
 	 */
-	writel(num_entries, ddata->base + sregs->reg_seq1);
 	ret = qcom_scm_io_writel(SEQUENCER_REG(seq_addr, SEQ_APM_CROSSOVER_VC), num_entries);
 	if (ret)
 		return ret;
@@ -1002,7 +1043,9 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 	if (ret)
 		return ret;
 
-	ret = qcom_scm_io_writel(SEQUENCER_REG(seq_addr, SEQ_APM_THRESH_PREVC), apm_vc - 1);
+	/* 0xff is "minus one" for the OSM sequencer */
+	ret = qcom_scm_io_writel(SEQUENCER_REG(seq_addr, SEQ_APM_THRESH_PREVC),
+				 apm_vc ? apm_vc - 1 : 0xff);
 	if (ret)
 		return ret;
 
@@ -1010,7 +1053,9 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 				 (0x39 | apm_vc << 6));
 	if (ret)
 		return ret;
-	dev_dbg(cpu_dev, "Wrote APM Pair: [%u-%u]\n", apm_vc - 1, apm_vc);
+	dev_info(cpu_dev, "Wrote APM: threshold VC %d, crossover VC %u\n",
+		 apm_vc, num_entries);
+
 
 	/*
 	 * We succeeded! Dispose of the table that got allocated during
@@ -1270,6 +1315,7 @@ static const struct qcom_cpufreq_soc_data msm8998_soc_data = {
 	.lut_max_entries = LUT_MAX_ENTRIES,
 	.clk_hw_div = 1,
 	.uses_tz = false,
+	.num_freq_domains = 2,
 	.setup_regs = {
 		/* Physical offset for sequencer scm calls */
 		.reg_osm_sequencer = 0x300,
@@ -1357,6 +1403,8 @@ static const struct of_device_id qcom_cpufreq_hw_match[] = {
 	{ .compatible = "qcom,cpufreq-epss", .data = &epss_soc_data },
 	{ .compatible = "qcom,shikra-epss", .data = &shikra_epss_soc_data },
 	{ .compatible = "qcom,msm8998-cpufreq-hw", .data = &msm8998_soc_data },
+	/* SDM630/636/660 OSM uses the same register layout as MSM8998 */
+	{ .compatible = "qcom,sdm660-cpufreq-hw", .data = &msm8998_soc_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, qcom_cpufreq_hw_match);
@@ -1472,6 +1520,19 @@ static int qcom_cpufreq_hw_osm_setup(struct device *cpu_dev,
 	u32 val;
 	int ret;
 
+	/*
+	 * Reprogramming a running OSM would change the LUT under its feet:
+	 * if something before us already enabled it, don't touch it.
+	 */
+	val = readl(drv_data->base + qcom_cpufreq.soc_data->reg_enable);
+	dev_info(cpu_dev, "OSM domain %d: enable=0x%x perf_state=0x%x\n", index, val,
+		 readl(drv_data->base + qcom_cpufreq.soc_data->reg_perf_state));
+	if (val & 0x1) {
+		dev_err(cpu_dev, "OSM domain %d already enabled, refusing to reprogram it\n",
+			index);
+		return -EBUSY;
+	}
+
 	ret = qcom_cpufreq_hw_write_lut(cpu_dev, policy, cpu_count, index);
 	if (ret)
 		return dev_err_probe(cpu_dev, ret, "Couldn't write LUT to hardware\n");
@@ -1562,7 +1623,15 @@ static int qcom_cpufreq_hw_osm_setup(struct device *cpu_dev,
 	if (ret)
 		return ret;
 
+	/*
+	 * Start from LUT index 0 (the 300MHz GPLL0 safe source), like the
+	 * downstream driver does before enabling the OSM, instead of whatever
+	 * the bootloader left in the request register.
+	 */
+	writel(0, drv_data->base + qcom_cpufreq.soc_data->reg_perf_state);
+
 	/* We're ready: enable the OSM and give it time to boot (5uS) */
+	dev_info(cpu_dev, "enabling OSM domain %d\n", index);
 	writel(1, drv_data->base + qcom_cpufreq.soc_data->reg_enable);
 	udelay(OSM_BOOT_TIME_US);
 
@@ -1609,12 +1678,14 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 
 	policy->dvfs_possible_from_any_cpu = true;
 
-	if (!qcom_cpufreq.soc_data->uses_tz) {
+	/* The OSM gets programmed only once: never reprogram it live */
+	if (!qcom_cpufreq.soc_data->uses_tz && !data->osm_programmed) {
 		ret = qcom_cpufreq_hw_osm_setup(cpu_dev, policy, cpu_count, index);
 		if (ret) {
 			dev_err(dev, "Cannot setup the OSM for CPU%d: %d\n", policy->cpu, ret);
 			return ret;
 		}
+		data->osm_programmed = true;
 	}
 
 	/* HW should be in enabled state to proceed */
@@ -1699,6 +1770,61 @@ static const struct clk_ops qcom_cpufreq_hw_clk_ops = {
 	.determine_rate = qcom_cpufreq_hw_determine_rate,
 };
 
+/* APCS_COMMON_LMH_CMD_RCGR: the OSM core clock (from hmss_gpll0) */
+#define APCS_LMH_CMD_RCGR		0x12c
+#define APCS_LMH_CFG_RCGR		0x130
+#define APCS_LMH_CMD_UPDATE		BIT(0)
+#define APCS_LMH_CMD_ROOT_OFF		BIT(31)
+/* src 1 (hmss_gpll0 at 300MHz), div 1.5 => 200MHz */
+#define APCS_LMH_CFG_200MHZ		0x102
+
+/**
+ * qcom_cpufreq_hw_osm_clk_check() - Check (and optionally set) the OSM clock
+ * @pdev: Platform device
+ *
+ * All of the OSM timer values that get programmed by this driver are
+ * expressed in cycles of a 200MHz OSM clock, which downstream sets up
+ * through the APCS_COMMON_LMH RCG. Log what the bootloader left there
+ * and, only if explicitly requested in DT, program it to 200MHz.
+ */
+static void qcom_cpufreq_hw_osm_clk_check(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	void __iomem *base;
+	u32 cmd, cfg;
+	int i;
+
+	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "apcs-common"))
+		return;
+
+	base = devm_platform_ioremap_resource_byname(pdev, "apcs-common");
+	if (IS_ERR(base)) {
+		dev_warn(dev, "Cannot map apcs-common: %pe\n", base);
+		return;
+	}
+
+	cmd = readl(base + APCS_LMH_CMD_RCGR);
+	cfg = readl(base + APCS_LMH_CFG_RCGR);
+	dev_info(dev, "OSM clock RCG: cmd=0x%08x cfg=0x%08x%s\n", cmd, cfg,
+		 (cfg & 0x71f) == APCS_LMH_CFG_200MHZ ? " (200MHz)" : "");
+
+	if (!of_property_read_bool(dev->of_node, "qcom,osm-clk-program") ||
+	    (cfg & 0x71f) == APCS_LMH_CFG_200MHZ)
+		return;
+
+	writel((cfg & ~0x71f) | APCS_LMH_CFG_200MHZ, base + APCS_LMH_CFG_RCGR);
+	writel(cmd | APCS_LMH_CMD_UPDATE, base + APCS_LMH_CMD_RCGR);
+
+	for (i = 0; i < 500; i++) {
+		if (!(readl(base + APCS_LMH_CMD_RCGR) & APCS_LMH_CMD_UPDATE))
+			break;
+		udelay(1);
+	}
+
+	dev_info(dev, "OSM clock RCG programmed: cmd=0x%08x cfg=0x%08x\n",
+		 readl(base + APCS_LMH_CMD_RCGR), readl(base + APCS_LMH_CFG_RCGR));
+}
+
 static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 {
 	const struct qcom_cpufreq_soc_data *soc_data;
@@ -1708,6 +1834,7 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	struct device_node *pd_node;
 	struct device *cpu_dev;
 	struct clk *clk;
+	bool bound;
 	int clk_div, i, num_domains, ret;
 
 	cpu_dev = get_cpu_device(0);
@@ -1733,9 +1860,8 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		 */
 		pd_node = of_parse_phandle(cpu_dev->of_node, "power-domains", 0);
 		if (!pd_node) {
-			ret = PTR_ERR(pd_node);
-			dev_err(cpu_dev, "power domain not found: %d\n", ret);
-			return ret;
+			dev_err(cpu_dev, "power domain not found\n");
+			return -ENODEV;
 		}
 
 		/*
@@ -1743,8 +1869,13 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		 * defer probing this driver until that is available.
 		 */
 		pd_dev = of_find_device_by_node(pd_node);
-		if (!pd_dev || !pd_dev->dev.driver ||
-		    !device_is_bound(&pd_dev->dev))
+		of_node_put(pd_node);
+		if (!pd_dev)
+			return -EPROBE_DEFER;
+
+		bound = pd_dev->dev.driver && device_is_bound(&pd_dev->dev);
+		put_device(&pd_dev->dev);
+		if (!bound)
 			return -EPROBE_DEFER;
 	}
 
@@ -1755,14 +1886,28 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	xo_rate = clk_get_rate(clk);
 	clk_put(clk);
 
-	clk = clk_get(dev, "alternate");
-	if (IS_ERR(clk))
-		return PTR_ERR(clk);
+	if (soc_data->uses_tz) {
+		clk = clk_get(dev, "alternate");
+		if (IS_ERR(clk))
+			return PTR_ERR(clk);
+	} else {
+		/*
+		 * The OSM sources the lowest frequency (and uses it as a safe
+		 * source while relocking the PLL) from this clock: keep it on.
+		 */
+		clk = devm_clk_get_enabled(dev, "alternate");
+		if (IS_ERR(clk))
+			return dev_err_probe(dev, PTR_ERR(clk), "Cannot enable alternate clock\n");
+	}
 
 	clk_div = soc_data->clk_hw_div ? soc_data->clk_hw_div : 1;
 	cpu_hw_rate = clk_get_rate(clk) / clk_div;
+	dev_info(dev, "alternate clock %lu Hz, xo %lu Hz\n", cpu_hw_rate, xo_rate);
 
-	clk_put(clk);
+	if (soc_data->uses_tz)
+		clk_put(clk);
+	else
+		qcom_cpufreq_hw_osm_clk_check(pdev);
 
 	cpufreq_qcom_hw_driver.driver_data = pdev;
 
@@ -1771,9 +1916,13 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to find icc paths\n");
 
-	for (num_domains = 0; num_domains < MAX_FREQ_DOMAINS; num_domains++)
-		if (!platform_get_resource(pdev, IORESOURCE_MEM, num_domains))
-			break;
+	if (soc_data->num_freq_domains) {
+		num_domains = soc_data->num_freq_domains;
+	} else {
+		for (num_domains = 0; num_domains < MAX_FREQ_DOMAINS; num_domains++)
+			if (!platform_get_resource(pdev, IORESOURCE_MEM, num_domains))
+				break;
+	}
 
 	qcom_cpufreq.data = devm_kzalloc(dev, sizeof(struct qcom_cpufreq_data) * num_domains,
 					 GFP_KERNEL);
