@@ -3207,11 +3207,20 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 
 	arvif->def_wep_key_idx = -1;
 
-	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
-	if (ret) {
-		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-		return;
+	/*
+	 * WCN3990 firmware on SDM660 (Onyx Note Air, 1.0.0.726) asserts
+	 * (err_qdi.c:459 wlan_process) when TXBF is set on a vdev that is
+	 * down: every disconnect or roam, and again on the restart replay, so
+	 * one disconnect became a crash loop. The next association sets TXBF
+	 * again (ath10k_bss_assoc), so skip the reset on SNOC.
+	 */
+	if (ar->hif.bus != ATH10K_BUS_SNOC) {
+		ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
+		if (ret) {
+			ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
+				    arvif->vdev_id, ret);
+			return;
+		}
 	}
 
 	arvif->is_up = false;
