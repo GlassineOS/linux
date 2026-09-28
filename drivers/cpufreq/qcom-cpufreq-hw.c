@@ -590,6 +590,19 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 		*acc_vc = -1;
 	}
 
+	/*
+	 * Every row must come from this CPU's own DT OPP table: these rows set
+	 * the cluster's voltages. (seen once: a stale table handed the gold cluster
+	 * two silver rows at silver voltages; never program such a LUT.)
+	 */
+	struct device_node *tbl_np __free(device_node) =
+		dev_pm_opp_of_get_opp_desc_node(cpu_dev);
+	if (!tbl_np)
+		return dev_err_probe(dev, -ENOENT, "No OPP table for %s\n", dev_name(cpu_dev));
+	if (gpd_opp_cnt != of_get_available_child_count(tbl_np))
+		return dev_err_probe(dev, -EINVAL, "%s: %d OPPs from the power domain, %d in its DT table: refusing\n",
+				     dev_name(cpu_dev), gpd_opp_cnt, of_get_available_child_count(tbl_np));
+
 	*hw_tbl = devm_kmalloc_array(&pdev->dev, gpd_opp_cnt,
 				     sizeof(**hw_tbl), GFP_KERNEL);
 	if (!*hw_tbl)
@@ -616,6 +629,14 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
 		if (!np) {
 			dev_pm_opp_put(genpd_opp);
 			return dev_err_probe(dev, -ENOENT, "Couldn't get OPP table");
+		}
+
+		if (np->parent != tbl_np) {
+			dev_err(dev, "%s: OPP %pOF is not in %pOF: refusing\n",
+				dev_name(cpu_dev), np, tbl_np);
+			of_node_put(np);
+			dev_pm_opp_put(genpd_opp);
+			return -EINVAL;
 		}
 
 		if (of_property_read_u32(np, "qcom,pll-override",
