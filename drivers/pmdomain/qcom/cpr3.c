@@ -2448,6 +2448,15 @@ static void cpr_pd_detach_dev(struct generic_pm_domain *domain,
 	guard(mutex)(&drv->lock);
 
 	dev_dbg(drv->dev, "detach callback for: %s\n", dev_name(dev));
+	/*
+	 * CPRh: attach installed (and adjusted) the OPP table of this device.
+	 * Remove it, or it outlives the device: genpd frees its virtual device
+	 * on a failed attach, and a later virtual device allocated at the same
+	 * address would be handed the stale table (another cluster's OPPs and
+	 * voltages).
+	 */
+	if (drv->desc->cpr_type == CTRL_TYPE_CPRH && thread->attached_cpu_dev == dev)
+		dev_pm_opp_of_remove_table(dev);
 	thread->attached_cpu_dev = NULL;
 }
 
