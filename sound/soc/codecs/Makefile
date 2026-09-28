@@ -498,6 +498,7 @@ obj-$(CONFIG_SND_SOC_AW88081)	+= snd-soc-aw88081.o
 obj-$(CONFIG_SND_SOC_AW88395_LIB) += snd-soc-aw88395-lib.o
 obj-$(CONFIG_SND_SOC_AW88395)	+=snd-soc-aw88395.o
 obj-$(CONFIG_SND_SOC_AW88166)	+=snd-soc-aw88166.o
+obj-$(CONFIG_SND_SOC_AW88194)	+= aw88194.o
 obj-$(CONFIG_SND_SOC_AW88261)	+=snd-soc-aw88261.o
 obj-$(CONFIG_SND_SOC_AW88399)	+= snd-soc-aw88399.o
 obj-$(CONFIG_SND_SOC_AW88399_LIB) += snd-soc-aw88399-lib.o
