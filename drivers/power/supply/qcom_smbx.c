@@ -942,10 +942,16 @@ static const struct smb_init_register smb_init_seq[] = {
 	  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
 		  BARK_WDOG_INT_EN_BIT,
 	  .val = 0 },
-	/* These bits aren't documented anywhere */
+	/*
+	 * These bits aren't documented anywhere. The 5 V AICL threshold: 0x3
+	 * (about 4.3 V) stopped the ramp at 125 mA on an Onyx Note Air (PM660)
+	 * behind a PC port whose VBUS sags to 4.3 V at ~110 mA: the device
+	 * drained while plugged in. 0x0 lets AICL ramp until VBUS sags ~4.1 V
+	 * (350 mA there; the stock kernel charged from the same port).
+	 */
 	{ .addr = USBIN_5V_AICL_THRESHOLD_CFG,
 	  .mask = USBIN_5V_AICL_THRESHOLD_CFG_MASK,
-	  .val = 0x3 },
+	  .val = 0x0 },
 	{ .addr = USBIN_CONT_AICL_THRESHOLD_CFG,
 	  .mask = USBIN_CONT_AICL_THRESHOLD_CFG_MASK,
 	  .val = 0x3 },
