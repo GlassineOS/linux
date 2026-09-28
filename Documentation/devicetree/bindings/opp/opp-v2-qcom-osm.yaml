@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/opp/opp-v2-qcom-osm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm OS-programmed OSM CPU OPP properties
+
+maintainers:
+  - Konrad Dybcio <konradybcio@kernel.org>
+
+description:
+  On SoCs where the Operating State Manager (OSM) is programmed by the OS
+  (MSM8998, SDM630/636/660), each CPU OPP carries the per-frequency OSM
+  lookup table parameters that cannot be derived from the frequency alone.
+  They are taken verbatim from the vendor clock plan.
+
+allOf:
+  - $ref: opp-v2-base.yaml#
+
+properties:
+  compatible:
+    const: operating-points-v2
+
+patternProperties:
+  '^opp-?[0-9]+$':
+    type: object
+
+    properties:
+      opp-hz: true
+      required-opps: true
+
+      qcom,pll-override:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: OSM PLL override value for this frequency
+
+      qcom,spare-data:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: MEM-ACC level (1-3) required at this frequency
+        minimum: 1
+        maximum: 3
+
+      qcom,pll-div:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: PLL post-divider for this frequency (0 = none)
+        maximum: 3
+
+    required:
+      - opp-hz
+      - qcom,pll-override
+
+    unevaluatedProperties: false
+
+# Only selected by the (unlikely) combination of the OSM properties
+select:
+  properties:
+    compatible:
+      const: operating-points-v2
+  patternProperties:
+    '^opp-?[0-9]+$':
+      required:
+        - qcom,pll-override
+  required:
+    - compatible
+
+required:
+  - compatible
+
+additionalProperties: true
+
+examples:
+  - |
+    opp-table {
+        compatible = "operating-points-v2";
+        opp-shared;
+
+        opp-633600000 {
+            opp-hz = /bits/ 64 <633600000>;
+            qcom,pll-override = <0x03200020>;
+            qcom,spare-data = <1>;
+            qcom,pll-div = <1>;
+        };
+    };
+...
