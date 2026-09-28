@@ -55,6 +55,7 @@
 
 #define LPASS_CDC_CLK_OTHR_RESET_B1_CTL		(0x014)
 #define LPASS_CDC_CLK_TX_CLK_EN_B1_CTL		(0x018)
+#define LPASS_CDC_CLK_DMIC_B2_CTL		(0x030)
 #define LPASS_CDC_CLK_OTHR_CTL			(0x01C)
 #define LPASS_CDC_CLK_RX_B1_CTL			(0x020)
 #define LPASS_CDC_CLK_MCLK_CTL			(0x024)
@@ -248,7 +249,7 @@ static const char * const rx_mix2_text[] = {
 };
 
 static const char *const dec_mux_text[] = {
-	"ZERO", "ADC1", "ADC2", "ADC3", "DMIC1", "DMIC2"
+	"ZERO", "ADC1", "ADC2", "ADC3", "DMIC1", "DMIC2", "DMIC3", "DMIC4"
 };
 
 static const char *const cic_mux_text[] = { "AMIC", "DMIC" };
@@ -286,9 +287,9 @@ static const struct soc_enum rx2_mix2_inp1_chain_enum =
 
 /* DEC */
 static const struct soc_enum dec1_mux_enum = SOC_ENUM_SINGLE(
-				LPASS_CDC_CONN_TX_B1_CTL, 0, 6, dec_mux_text);
+				LPASS_CDC_CONN_TX_B1_CTL, 0, 8, dec_mux_text);
 static const struct soc_enum dec2_mux_enum = SOC_ENUM_SINGLE(
-				LPASS_CDC_CONN_TX_B1_CTL, 3, 6, dec_mux_text);
+				LPASS_CDC_CONN_TX_B1_CTL, 3, 8, dec_mux_text);
 
 /* CIC */
 static const struct soc_enum cic1_mux_enum = SOC_ENUM_SINGLE(
@@ -665,35 +666,35 @@ static int msm8916_wcd_digital_enable_dmic(struct snd_soc_dapm_widget *w,
 	unsigned int dmic;
 	int ret;
 	/* get dmic number out of widget name */
-	char *dmic_num = strpbrk(w->name, "12");
+	char *dmic_num = strpbrk(w->name, "1234");
 
 	if (dmic_num == NULL) {
 		dev_err(component->dev, "Invalid DMIC\n");
 		return -EINVAL;
 	}
 	ret = kstrtouint(dmic_num, 10, &dmic);
-	if (ret < 0 || dmic > 2) {
+	if (ret < 0 || dmic > 4) {
 		dev_err(component->dev, "Invalid DMIC line on the component\n");
 		return -EINVAL;
 	}
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
-		snd_soc_component_update_bits(component, LPASS_CDC_CLK_DMIC_B1_CTL,
+		/* DMIC1/2 clock from B1, DMIC3/4 (second pair, same layout) from B2 */
+		snd_soc_component_update_bits(component, dmic <= 2 ?
+				    LPASS_CDC_CLK_DMIC_B1_CTL : LPASS_CDC_CLK_DMIC_B2_CTL,
 				    DMIC_B1_CTL_DMIC0_CLK_SEL_MASK,
 				    DMIC_B1_CTL_DMIC0_CLK_SEL_DIV3);
-		switch (dmic) {
-		case 1:
-			snd_soc_component_update_bits(component, LPASS_CDC_TX1_DMIC_CTL,
-					    TXN_DMIC_CTL_CLK_SEL_MASK,
-					    TXN_DMIC_CTL_CLK_SEL_DIV3);
-			break;
-		case 2:
-			snd_soc_component_update_bits(component, LPASS_CDC_TX2_DMIC_CTL,
-					    TXN_DMIC_CTL_CLK_SEL_MASK,
-					    TXN_DMIC_CTL_CLK_SEL_DIV3);
-			break;
-		}
+		/*
+		 * The TXn divider belongs to the decimator, and any DEC mux can
+		 * pick any DMIC: set both, always the same rate as the DMIC clock.
+		 */
+		snd_soc_component_update_bits(component, LPASS_CDC_TX1_DMIC_CTL,
+				    TXN_DMIC_CTL_CLK_SEL_MASK,
+				    TXN_DMIC_CTL_CLK_SEL_DIV3);
+		snd_soc_component_update_bits(component, LPASS_CDC_TX2_DMIC_CTL,
+				    TXN_DMIC_CTL_CLK_SEL_MASK,
+				    TXN_DMIC_CTL_CLK_SEL_DIV3);
 		break;
 	}
 
@@ -794,6 +795,14 @@ static const struct snd_soc_dapm_widget msm8916_wcd_digital_dapm_widgets[] = {
 			   msm8916_wcd_digital_enable_dmic,
 			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_SUPPLY("DMIC_CLK", LPASS_CDC_CLK_DMIC_B1_CTL, 0, 0,
+			    NULL, 0),
+	SND_SOC_DAPM_ADC_E("DMIC3", NULL, SND_SOC_NOPM, 0, 0,
+			   msm8916_wcd_digital_enable_dmic,
+			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_ADC_E("DMIC4", NULL, SND_SOC_NOPM, 0, 0,
+			   msm8916_wcd_digital_enable_dmic,
+			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_SUPPLY("DMIC_CLK2", LPASS_CDC_CLK_DMIC_B2_CTL, 0, 0,
 			    NULL, 0),
 	SND_SOC_DAPM_SUPPLY("RX_I2S_CLK", LPASS_CDC_CLK_RX_I2S_CTL,
 			    4, 0, NULL, 0),
@@ -944,6 +953,8 @@ static const struct snd_soc_dapm_route msm8916_wcd_digital_audio_map[] = {
 	/* Decimator Inputs */
 	{"DEC1 MUX", "DMIC1", "DMIC1"},
 	{"DEC1 MUX", "DMIC2", "DMIC2"},
+	{"DEC1 MUX", "DMIC3", "DMIC3"},
+	{"DEC1 MUX", "DMIC4", "DMIC4"},
 	{"DEC1 MUX", "ADC1", "ADC1"},
 	{"DEC1 MUX", "ADC2", "ADC2"},
 	{"DEC1 MUX", "ADC3", "ADC3"},
@@ -951,6 +962,8 @@ static const struct snd_soc_dapm_route msm8916_wcd_digital_audio_map[] = {
 
 	{"DEC2 MUX", "DMIC1", "DMIC1"},
 	{"DEC2 MUX", "DMIC2", "DMIC2"},
+	{"DEC2 MUX", "DMIC3", "DMIC3"},
+	{"DEC2 MUX", "DMIC4", "DMIC4"},
 	{"DEC2 MUX", "ADC1", "ADC1"},
 	{"DEC2 MUX", "ADC2", "ADC2"},
 	{"DEC2 MUX", "ADC3", "ADC3"},
@@ -958,6 +971,8 @@ static const struct snd_soc_dapm_route msm8916_wcd_digital_audio_map[] = {
 
 	{"DMIC1", NULL, "DMIC_CLK"},
 	{"DMIC2", NULL, "DMIC_CLK"},
+	{"DMIC3", NULL, "DMIC_CLK2"},
+	{"DMIC4", NULL, "DMIC_CLK2"},
 
 	{"I2S TX1", NULL, "CIC1 MUX"},
 	{"I2S TX2", NULL, "CIC2 MUX"},
