@@ -514,6 +514,12 @@ static void dpu_clear_irqs(struct dpu_kms *dpu_kms)
 	wmb();
 }
 
+/* runtime suspend: nothing may stay latched once the clocks are off */
+void dpu_core_irq_clear_pending(struct dpu_kms *dpu_kms)
+{
+	dpu_clear_irqs(dpu_kms);
+}
+
 static void dpu_disable_all_irqs(struct dpu_kms *dpu_kms)
 {
 	struct dpu_hw_intr *intr = dpu_kms->hw_intr;

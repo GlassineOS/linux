@@ -12,6 +12,8 @@ void dpu_core_irq_preinstall(struct msm_kms *kms);
 
 void dpu_core_irq_uninstall(struct msm_kms *kms);
 
+void dpu_core_irq_clear_pending(struct dpu_kms *dpu_kms);
+
 irqreturn_t dpu_core_irq(struct msm_kms *kms);
 
 u32 dpu_core_irq_read(
