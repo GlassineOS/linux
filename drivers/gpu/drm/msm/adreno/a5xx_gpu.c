@@ -699,6 +699,25 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	u32 hbb;
 	int ret;
 
+	/*
+	 * Start from a reset CP. hw_init runs after every runtime resume and
+	 * assumes the GX domain lost power meanwhile. On sdm630/660 the GX
+	 * GDSC belongs to the SMMU node (sdm630.dtsi; the adreno node only
+	 * votes VDDMX), which autosuspends 20 ms after the GPU (250 ms): work
+	 * arriving in that window resumes a GPU that never lost power, so the
+	 * CP keeps its old RB read pointer while the ring restarts at 0 and
+	 * replays stale ring contents up to the wrap, sooner or later into a
+	 * torn packet (NA1 A509: "drain ringbuffer rptr/wptr = 135/9" and
+	 * "820/9", CP_RB_RPTR still at the old position, then CP opcode
+	 * errors; after the recover no fence ever signalled). a5xx_recover
+	 * resets the same way.
+	 */
+	if (adreno_is_a509(adreno_gpu)) {
+		gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
+		gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+		gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
+	}
+
 	gpu_write(gpu, REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
 
 	if (adreno_is_a509(adreno_gpu) || adreno_is_a512(adreno_gpu) ||
