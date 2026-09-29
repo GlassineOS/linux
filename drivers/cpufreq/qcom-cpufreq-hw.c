@@ -1879,7 +1879,14 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		 * performed, as in that case, we wouldn't know where to take
 		 * the params from...
 		 */
-		pd_node = of_parse_phandle(cpu_dev->of_node, "power-domains", 0);
+		/*
+		 * The CPRh domain by name: a CPU may also list its PSCI idle
+		 * domain ("psci", which is first where both are present: the
+		 * idle-state lookup reads index 0) and that one is never a
+		 * platform device (NA1: probe deferred forever, no cpufreq).
+		 */
+		i = of_property_match_string(cpu_dev->of_node, "power-domain-names", "perf");
+		pd_node = of_parse_phandle(cpu_dev->of_node, "power-domains", i < 0 ? 0 : i);
 		if (!pd_node) {
 			dev_err(cpu_dev, "power domain not found\n");
 			return -ENODEV;
