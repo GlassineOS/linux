@@ -942,6 +942,15 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	if (a5xx_gpu->shadow_bo) {
 		gpu_write64(gpu, REG_A5XX_CP_RB_RPTR_ADDR,
 			    shadowptr(a5xx_gpu, gpu->rb[0]));
+		/*
+		 * The rings restart at 0, so must the rptr shadows (as on
+		 * a6xx). Only pm_suspend cleared them: after a recover the
+		 * shadow still held the old rptr, so every drain check and
+		 * preemption emptiness check saw a stale position (NA1 A509:
+		 * "drain ringbuffer rptr/wptr = 135/9", then CP opcode faults).
+		 */
+		for (unsigned int i = 0; i < gpu->nr_rings; i++)
+			a5xx_gpu->shadow[i] = 0;
 	}
 
 	a5xx_preempt_hw_init(gpu);
@@ -1846,7 +1855,13 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 
 	nr_rings = 4;
 
-	if (config->info->revn == 510)
+	/*
+	 * A509 (NA1): one ring, no preemption. Nothing here needs priority
+	 * rings, and the CP ran on a stale rptr after the 09-29 recovery
+	 * (rb 0135/0036, rptr past wptr): one ring removes the preemption
+	 * state from the recovery path.
+	 */
+	if (config->info->revn == 510 || config->info->revn == 509)
 		nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);
