@@ -871,13 +871,21 @@ static const struct smb_init_register smb_init_seq[] = {
 	 * When connected to a wall charger, and automatically stop when it detects
 	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
 	 */
+	/*
+	 * AICL rerun: without it, one collapse (a VBUS dip at boot or under
+	 * load on a weak port) leaves the input limit at its 25 mA minimum
+	 * until the cable is replugged. Seen on an Onyx Note Air (PM660):
+	 * ICL_STATUS 1 step, AICL_STATUS ICL_IMIN, battery draining on USB;
+	 * setting the rerun bit live brought it back to 250 mA in seconds.
+	 */
 	{ .addr = USBIN_AICL_OPTIONS_CFG,
 	  .mask = USBIN_AICL_START_AT_MAX_BIT | USBIN_AICL_ADC_EN_BIT |
 		  USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT |
 		  USBIN_HV_COLLAPSE_RESPONSE_BIT |
-		  USBIN_LV_COLLAPSE_RESPONSE_BIT,
+		  USBIN_LV_COLLAPSE_RESPONSE_BIT | USBIN_AICL_RERUN_EN_BIT,
 	  .val = USBIN_HV_COLLAPSE_RESPONSE_BIT |
-		 USBIN_LV_COLLAPSE_RESPONSE_BIT | USBIN_AICL_EN_BIT },
+		 USBIN_LV_COLLAPSE_RESPONSE_BIT | USBIN_AICL_EN_BIT |
+		 USBIN_AICL_RERUN_EN_BIT },
 	/*
 	 * Set pre charge current to default, the OnePlus 6 bootloader
 	 * sets this very conservatively.
