@@ -58,6 +58,7 @@ extern bool dpu_use_virtual_planes;
 
 struct dpu_kms {
 	struct msm_kms base;
+	bool irq_fenced;		/* runtime suspended: base.irq disabled */
 	struct drm_device *dev;
 	const struct dpu_mdss_cfg *catalog;
 	const struct qcom_ubwc_cfg_data *mdss;

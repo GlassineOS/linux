@@ -1438,6 +1438,21 @@ static int __maybe_unused dpu_runtime_suspend(struct device *dev)
 	struct msm_drm_private *priv = platform_get_drvdata(pdev);
 	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
 
+	/*
+	 * The handler reads DPU registers: with the clocks off that is a
+	 * synchronous external abort (NA1, sdm660: dpu_reg_read from
+	 * dpu_core_irq via msm_mdss_irq while the link cycled). Fence the
+	 * interrupt (disable_irq also waits for a handler running on another
+	 * CPU), then clear what is latched while the registers still answer:
+	 * the MDSS line is level and its mask is software only, so a status
+	 * left set would keep firing into the disabled interrupt.
+	 */
+	if (dpu_kms->base.irq_requested && !dpu_kms->irq_fenced) {
+		disable_irq(dpu_kms->base.irq);
+		dpu_kms->irq_fenced = true;
+	}
+	dpu_core_irq_clear_pending(dpu_kms);
+
 	clk_bulk_disable_unprepare(dpu_kms->num_clocks, dpu_kms->clocks);
 
 	for (i = 0; i < dpu_kms->num_paths; i++)
@@ -1461,6 +1476,11 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 	if (rc) {
 		DPU_ERROR("clock enable failed rc:%d\n", rc);
 		return rc;
+	}
+
+	if (dpu_kms->irq_fenced) {
+		enable_irq(dpu_kms->base.irq);
+		dpu_kms->irq_fenced = false;
 	}
 
 	dpu_vbif_init_memtypes(dpu_kms);
