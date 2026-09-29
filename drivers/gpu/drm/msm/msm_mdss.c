@@ -44,6 +44,17 @@ struct msm_mdss {
 	struct icc_path *mdp_path[2];
 	u32 num_mdp_paths;
 	struct icc_path *reg_bus_path;
+	/*
+	 * NA1: the parent line is level-triggered and a child (DSI, DPU) can
+	 * still assert it after runtime suspend switched the clocks off; the
+	 * handler's status read then takes a synchronous external abort (a
+	 * frozen SoC). Suspend masks the line at the GIC first; clk_off, under
+	 * irq_lock, covers a handler already running on another CPU.
+	 */
+	int irq;
+	spinlock_t irq_lock;
+	bool clk_off;
+	bool irq_masked;
 };
 
 static int msm_mdss_parse_data_bus_icc_path(struct device *dev,
@@ -81,6 +92,13 @@ static void msm_mdss_irq(struct irq_desc *desc)
 
 	chained_irq_enter(chip, desc);
 
+	spin_lock(&msm_mdss->irq_lock);
+	if (msm_mdss->clk_off) {
+		spin_unlock(&msm_mdss->irq_lock);
+		chained_irq_exit(chip, desc);
+		return;
+	}
+
 	interrupts = readl_relaxed(msm_mdss->mmio + REG_MDSS_HW_INTR_STATUS);
 
 	while (interrupts) {
@@ -98,6 +116,7 @@ static void msm_mdss_irq(struct irq_desc *desc)
 		interrupts &= ~(1 << hwirq);
 	}
 
+	spin_unlock(&msm_mdss->irq_lock);
 	chained_irq_exit(chip, desc);
 }
 
@@ -418,6 +437,10 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 	if (ret)
 		return ERR_PTR(ret);
 
+	msm_mdss->irq = irq;
+	spin_lock_init(&msm_mdss->irq_lock);
+	/* a chained handler never checks the disabled state: mask for real */
+	irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
 	irq_set_chained_handler_and_data(irq, msm_mdss_irq,
 					 msm_mdss);
 
@@ -429,8 +452,17 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 static int __maybe_unused mdss_runtime_suspend(struct device *dev)
 {
 	struct msm_mdss *mdss = dev_get_drvdata(dev);
+	unsigned long flags;
 
 	DBG("");
+
+	if (mdss->irq > 0 && !mdss->irq_masked) {
+		disable_irq_nosync(mdss->irq);
+		mdss->irq_masked = true;
+	}
+	spin_lock_irqsave(&mdss->irq_lock, flags);
+	mdss->clk_off = true;
+	spin_unlock_irqrestore(&mdss->irq_lock, flags);
 
 	return msm_mdss_disable(mdss);
 }
@@ -438,10 +470,22 @@ static int __maybe_unused mdss_runtime_suspend(struct device *dev)
 static int __maybe_unused mdss_runtime_resume(struct device *dev)
 {
 	struct msm_mdss *mdss = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
 
 	DBG("");
 
-	return msm_mdss_enable(mdss);
+	ret = msm_mdss_enable(mdss);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&mdss->irq_lock, flags);
+	mdss->clk_off = false;
+	spin_unlock_irqrestore(&mdss->irq_lock, flags);
+	if (mdss->irq_masked) {
+		enable_irq(mdss->irq);
+		mdss->irq_masked = false;
+	}
+	return 0;
 }
 
 static int __maybe_unused mdss_pm_suspend(struct device *dev)
