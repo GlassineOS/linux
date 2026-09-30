@@ -294,12 +294,21 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 			q6asm_read(prtd->audio_client, prtd->stream_id);
 
 	}
-	if (ret < 0)
+	if (ret < 0) {
+		/*
+		 * NA1: the stream is open in the DSP (routed, buffers mapped)
+		 * but not RUNNING, so close() would skip CMD_CLOSE and leave
+		 * the ASM session behind: the ADSP never slept again after a
+		 * rejected format (PipeWire's startup probe).
+		 */
 		dev_info(dev, "%s: CMD Format block failed\n", __func__);
-	else
-		prtd->state = Q6ASM_STREAM_RUNNING;
+		q6routing_stream_close(soc_prtd->dai_link->id,
+				       substream->stream);
+		goto routing_err;
+	}
+	prtd->state = Q6ASM_STREAM_RUNNING;
 
-	return ret;
+	return 0;
 
 routing_err:
 	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
