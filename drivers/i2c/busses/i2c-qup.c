@@ -1993,6 +1993,16 @@ static int qup_i2c_pm_resume_runtime(struct device *device)
 
 static int qup_i2c_suspend(struct device *device)
 {
+	struct qup_i2c_dev *qup = dev_get_drvdata(device);
+
+	/*
+	 * NA1: a client's threaded IRQ (cyttsp5) can still start a transfer
+	 * after this. With the clocks cut under it, the QUP IRQ handler's
+	 * status read takes a synchronous external abort (900E). Marking the
+	 * adapter suspended waits out a transfer in flight (bus lock) and
+	 * fails later ones with -ESHUTDOWN.
+	 */
+	i2c_mark_adapter_suspended(&qup->adap);
 	if (!pm_runtime_suspended(device))
 		return qup_i2c_pm_suspend_runtime(device);
 	return 0;
@@ -2000,12 +2010,14 @@ static int qup_i2c_suspend(struct device *device)
 
 static int qup_i2c_resume(struct device *device)
 {
+	struct qup_i2c_dev *qup = dev_get_drvdata(device);
 	int ret;
 
 	ret = qup_i2c_pm_resume_runtime(device);
 	if (ret)
 		return ret;
 
+	i2c_mark_adapter_resumed(&qup->adap);
 	pm_request_autosuspend(device);
 	return 0;
 }

@@ -651,8 +651,8 @@ static int cyttsp5_power_control(struct cyttsp5 *ts, bool on)
 	if (ts->response_buf[2] != HID_RESPONSE_REPORT_ID ||
 	    (ts->response_buf[3] & 0x03) != state ||
 	    (ts->response_buf[4] & 0x0f) != HID_CMD_SET_POWER) {
-		dev_err(ts->dev, "Validation of the %s response failed\n",
-			on ? "wakeup" : "sleep");
+		dev_err(ts->dev, "Validation of the %s response failed (%*ph)\n",
+			on ? "wakeup" : "sleep", 5, ts->response_buf);
 		return -EINVAL;
 	}
 
