@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/device/faux.h>
+#include <linux/workqueue.h>
 #include <linux/psci.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -474,17 +475,44 @@ static bool __init dt_idle_state_present(void)
 	return !!of_match_node(psci_idle_state_match, state_node);
 }
 
+/*
+ * NA1: a faux device probes exactly once and can't defer. When the CPU PM
+ * domains hang below a provider that probes later (the MPM genpd on sdm660,
+ * parent of the system domain), the attach returns -EPROBE_DEFER and the
+ * idle driver was lost for good (no cpuidle at all). Retry until they exist.
+ */
+#define PSCI_IDLE_RETRIES	100	/* x 100 ms */
+
+static void psci_idle_retry_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(psci_idle_retry, psci_idle_retry_fn);
+static int psci_idle_tries;
+
+static bool psci_idle_create(void)
+{
+	return faux_device_create("psci-cpuidle", NULL, &psci_cpuidle_ops);
+}
+
+static void psci_idle_retry_fn(struct work_struct *work)
+{
+	psci_idle_tries++;
+	if (psci_idle_create()) {
+		pr_info("psci-cpuidle up after %d retries\n", psci_idle_tries);
+		return;
+	}
+	if (psci_idle_tries < PSCI_IDLE_RETRIES)
+		schedule_delayed_work(&psci_idle_retry, msecs_to_jiffies(100));
+	else
+		pr_err("Failed to create psci-cpuidle device\n");
+}
+
 static int __init psci_idle_init(void)
 {
-	struct faux_device *fdev;
-
 	if (!dt_idle_state_present())
 		return 0;
 
-	fdev = faux_device_create("psci-cpuidle", NULL, &psci_cpuidle_ops);
-	if (!fdev) {
-		pr_err("Failed to create psci-cpuidle device\n");
-		return -ENODEV;
+	if (!psci_idle_create()) {
+		pr_info("psci-cpuidle: CPU PM domains not ready, retrying\n");
+		schedule_delayed_work(&psci_idle_retry, msecs_to_jiffies(100));
 	}
 
 	return 0;
