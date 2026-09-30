@@ -30,6 +30,8 @@ struct msm_mdss_data {
 
 struct msm_mdss {
 	struct device *dev;
+	/* NA1: suspend-order link to the display SMMU */
+	struct device_link *iommu_link;
 
 	void __iomem *mmio;
 	struct clk_bulk_data *clocks;
@@ -510,6 +512,42 @@ static const struct dev_pm_ops mdss_pm_ops = {
 	SET_RUNTIME_PM_OPS(mdss_runtime_suspend, mdss_runtime_resume, NULL)
 };
 
+/*
+ * NA1: only the MDP child names the SMMU (iommus), so nothing orders this
+ * parent against it: system suspend powered the MMSS SMMU down (its
+ * mnoc_ahb/bimc_smmu clocks off) before the parent, and the parent's
+ * mdss_ahb_clk then could not finish its off handshake ("status stuck at
+ * 'on'", every suspend; a runtime suspend, SMMU still up, gates it fine).
+ * A stateless link makes the parent suspend before and resume after the
+ * SMMU.
+ */
+static void mdss_link_iommu_supplier(struct msm_mdss *mdss)
+{
+	struct device *dev = mdss->dev;
+	struct device_node *child;
+
+	for_each_available_child_of_node(dev->of_node, child) {
+		struct of_phandle_args args;
+		struct platform_device *smmu;
+
+		if (of_parse_phandle_with_args(child, "iommus", "#iommu-cells",
+					       0, &args))
+			continue;
+		smmu = of_find_device_by_node(args.np);
+		of_node_put(args.np);
+		if (!smmu)
+			continue;
+		mdss->iommu_link = device_link_add(dev, &smmu->dev,
+						   DL_FLAG_STATELESS);
+		if (!mdss->iommu_link)
+			dev_warn(dev, "no suspend-order link to %s\n",
+				 dev_name(&smmu->dev));
+		put_device(&smmu->dev);
+		of_node_put(child);
+		return;
+	}
+}
+
 static int mdss_probe(struct platform_device *pdev)
 {
 	struct msm_mdss *mdss;
@@ -536,6 +574,8 @@ static int mdss_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	mdss_link_iommu_supplier(mdss);
+
 	return 0;
 }
 
@@ -545,6 +585,8 @@ static void mdss_remove(struct platform_device *pdev)
 
 	of_platform_depopulate(&pdev->dev);
 
+	if (mdss->iommu_link)
+		device_link_del(mdss->iommu_link);
 	msm_mdss_destroy(mdss);
 }
 
