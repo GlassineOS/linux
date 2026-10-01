@@ -295,6 +295,7 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
 		return;
 	}
+	msm_dsi->link_powered = true;
 
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
@@ -316,6 +317,7 @@ host1_en_fail:
 	msm_dsi_host_disable(host);
 host_en_fail:
 	dsi_mgr_bridge_power_off(bridge);
+	msm_dsi->link_powered = false;
 }
 
 void msm_dsi_manager_tpg_enable(void)
@@ -349,6 +351,18 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	 */
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		goto disable_phy;
+
+	/*
+	 * NA1: pre_enable's power-on failed (the 14nm PLL does not lock for
+	 * ~1 s after resume) and its error path already turned the PHY off.
+	 * Undoing it again here disabled the never-enabled IRQ (the depth
+	 * grew with every failure, so a later good power-on left the DSI IRQ
+	 * off: link dead until reboot), disabled the PHY regulators a second
+	 * time (unbalanced l1) and underflowed the PHY's runtime PM count.
+	 */
+	if (!msm_dsi->link_powered)
+		return;
+	msm_dsi->link_powered = false;
 
 	ret = msm_dsi_host_disable(host);
 	if (ret)
