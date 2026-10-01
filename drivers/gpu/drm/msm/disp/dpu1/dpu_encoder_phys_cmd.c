@@ -301,6 +301,36 @@ end:
 	return ret;
 }
 
+/*
+ * NA1: with vblank references held (the count is legitimately > 0 here when
+ * the CRTC's drm vblank is on), the 0->1 registration in control_vblank_irq
+ * does not run, so make sure the RDPTR callback (the cmd-mode vblank) is
+ * really registered: a kickoff timeout unregisters it behind the count's
+ * back (10-01, d0d11882: never re-registered, every frame finished via the
+ * 84 ms kickoff timeouts, epdd declared every link dead, panel undriven
+ * until reboot). Unregister + register also rewrites its enable bit after
+ * the MDSS GDSC reset. The count itself is left alone.
+ */
+static void dpu_encoder_phys_cmd_vblank_rearm(struct dpu_encoder_phys *phys_enc)
+{
+	if (!dpu_encoder_phys_cmd_is_master(phys_enc) || !phys_enc->irq[INTR_IDX_RDPTR])
+		return;
+
+	mutex_lock(&phys_enc->vblank_ctl_lock);
+	if (phys_enc->vblank_refcount) {
+		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
+				phys_enc->irq[INTR_IDX_RDPTR]);
+		if (dpu_core_irq_register_callback(phys_enc->dpu_kms,
+				phys_enc->irq[INTR_IDX_RDPTR],
+				dpu_encoder_phys_cmd_te_rd_ptr_irq, phys_enc))
+			DRM_ERROR("id:%u pp:%d RDPTR re-register failed (vblank refcount %d)\n",
+				  DRMID(phys_enc->parent),
+				  phys_enc->hw_pp->idx - PINGPONG_0,
+				  phys_enc->vblank_refcount);
+	}
+	mutex_unlock(&phys_enc->vblank_ctl_lock);
+}
+
 static void dpu_encoder_phys_cmd_irq_enable(struct dpu_encoder_phys *phys_enc)
 {
 	trace_dpu_enc_phys_cmd_irq_enable(DRMID(phys_enc->parent),
@@ -315,6 +345,7 @@ static void dpu_encoder_phys_cmd_irq_enable(struct dpu_encoder_phys *phys_enc)
 				       phys_enc->irq[INTR_IDX_UNDERRUN],
 				       dpu_encoder_phys_cmd_underrun_irq,
 				       phys_enc);
+	dpu_encoder_phys_cmd_vblank_rearm(phys_enc);
 	dpu_encoder_phys_cmd_control_vblank_irq(phys_enc, true);
 
 	if (dpu_encoder_phys_cmd_is_master(phys_enc) && phys_enc->irq[INTR_IDX_CTL_START])
