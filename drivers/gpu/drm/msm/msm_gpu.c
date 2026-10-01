@@ -77,8 +77,16 @@ static int disable_clk(struct msm_gpu *gpu)
 	 * speed had to be non zero to avoid problems. On newer targets this
 	 * will be rounded down to zero anyway so it all works out.
 	 */
-	if (gpu->core_clk)
+	if (gpu->core_clk) {
 		dev_pm_opp_set_rate(&gpu->pdev->dev, 27000000);
+		/*
+		 * NA1: the low OPP still carries the idle OPP's bandwidth
+		 * (sdm630: 1.2 GB/s, untagged = sleep set too) and its CX
+		 * level, so a powered-down GPU kept DDR up in suspend. Drop
+		 * both; enable_clk()'s set_rate restores them.
+		 */
+		dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
+	}
 
 	if (gpu->rbbmtimer_clk)
 		clk_set_rate(gpu->rbbmtimer_clk, 0);
