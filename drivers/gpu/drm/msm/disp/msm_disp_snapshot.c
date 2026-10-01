@@ -5,6 +5,8 @@
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
 
+#include <linux/moduleparam.h>
+
 #include "msm_disp_snapshot.h"
 
 static ssize_t __maybe_unused disp_devcoredump_read(char *buffer, loff_t offset,
@@ -78,10 +80,23 @@ static void _msm_disp_snapshot_work(struct kthread_work *work)
 			disp_devcoredump_read, msm_disp_state_free);
 }
 
+/*
+ * NA1: the error snapshot (queued by e.g. the cmd encoder's kickoff timeout)
+ * runs later in a worker and reads every display block, the DSI PHY included.
+ * By then a failed link has been powered down: the PHY register read was a
+ * synchronous external abort -> crash dump (2026-10-02, after a link
+ * stall). Off unless asked for: msm.na1_err_snapshot=1 (debugfs dumps stay).
+ */
+static bool na1_err_snapshot;
+module_param(na1_err_snapshot, bool, 0644);
+
 void msm_disp_snapshot_state(struct drm_device *drm_dev)
 {
 	struct msm_drm_private *priv;
 	struct msm_kms *kms;
+
+	if (!na1_err_snapshot)
+		return;
 
 	if (!drm_dev) {
 		DRM_ERROR("invalid params\n");
