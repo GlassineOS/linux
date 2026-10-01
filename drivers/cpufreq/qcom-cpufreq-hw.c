@@ -29,6 +29,7 @@
 #include <linux/spinlock.h>
 #include <linux/units.h>
 #include <soc/qcom/cpr.h>
+#include <dt-bindings/interconnect/qcom,rpm-icc.h>
 
 #define LUT_MAX_ENTRIES			40U
 #define LUT_SRC_845			GENMASK(31, 30)
@@ -291,6 +292,12 @@ struct qcom_cpufreq_data {
 	struct device *pd_dev;
 	bool osm_programmed;
 
+	/*
+	 * OS-programmed OSM: the CPU's DDR floor (the CPU node's interconnects
+	 * + opp-peak-kBps), an active-only vote that follows the frequency
+	 */
+	struct icc_path *mem_path;
+
 	bool per_core_dcvs;
 };
 
@@ -328,6 +335,66 @@ static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 	ret = dev_pm_opp_set_opp(dev, opp);
 	dev_pm_opp_put(opp);
 	return ret;
+}
+
+/**
+ * qcom_cpufreq_set_mem_floor() - Vote the DDR floor of a frequency
+ * @policy:   CPUFreq policy structure
+ * @freq_khz: CPU Frequency in KHz
+ *
+ * For an OS-programmed OSM, where dev_pm_opp_set_opp() would also drive the
+ * CPRh required-opps: only the bandwidth, on the driver's own path (active
+ * only, so it never holds the RPM sleep set: suspend and XO shutdown stay
+ * possible).
+ */
+static void qcom_cpufreq_set_mem_floor(struct cpufreq_policy *policy,
+				       unsigned long freq_khz)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	struct device *dev = get_cpu_device(policy->cpu);
+	struct dev_pm_opp *opp;
+	unsigned long peak;
+
+	if (!dev)
+		return;
+	opp = dev_pm_opp_find_freq_exact(dev, freq_khz * 1000, true);
+	if (IS_ERR(opp))
+		return;
+	peak = dev_pm_opp_get_bw(opp, true, 0);
+	dev_pm_opp_put(opp);
+	icc_set_bw(data->mem_path, 0, peak);
+}
+
+static unsigned int qcom_cpufreq_get_freq(struct cpufreq_policy *policy);
+
+/**
+ * qcom_cpufreq_mem_floor_init() - Set up the DDR floor vote
+ * @cpu_dev: CPU device
+ * @policy:  CPUFreq policy structure
+ *
+ * Returns: Zero when there is a path or none is described, otherwise a
+ * negative number (also -EPROBE_DEFER) on errors.
+ */
+static int qcom_cpufreq_mem_floor_init(struct device *cpu_dev,
+				       struct cpufreq_policy *policy)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	struct icc_path *path;
+
+	if (qcom_cpufreq.soc_data->uses_tz || data->mem_path)
+		return 0;
+
+	path = of_icc_get(cpu_dev, NULL);
+	if (IS_ERR(path))
+		return dev_err_probe(cpu_dev, PTR_ERR(path), "no DDR path\n");
+	if (!path)
+		return 0;
+
+	icc_set_tag(path, RPM_ACTIVE_TAG);
+	data->mem_path = path;
+	qcom_cpufreq_set_mem_floor(policy, qcom_cpufreq_get_freq(policy));
+	dev_info(cpu_dev, "DDR floor follows the frequency (active only)\n");
+	return 0;
 }
 
 /**
@@ -395,6 +462,8 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	 */
 	if (icc_scaling_enabled && soc_data->uses_tz)
 		qcom_cpufreq_set_bw(policy, freq);
+	else if (data->mem_path)
+		qcom_cpufreq_set_mem_floor(policy, freq);
 
 	return 0;
 }
@@ -1727,6 +1796,10 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 	}
 
+	ret = qcom_cpufreq_mem_floor_init(cpu_dev, policy);
+	if (ret)
+		return ret;
+
 	return qcom_cpufreq_hw_lmh_init(policy, index);
 }
 
@@ -1735,6 +1808,8 @@ static void qcom_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
 	struct device *cpu_dev = get_cpu_device(policy->cpu);
 	struct qcom_cpufreq_data *data = policy->driver_data;
 
+	icc_put(data->mem_path);
+	data->mem_path = NULL;
 	dev_pm_opp_remove_all_dynamic(cpu_dev);
 	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
 	qcom_cpufreq_hw_lmh_exit(data);
