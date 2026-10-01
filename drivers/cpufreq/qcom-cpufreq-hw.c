@@ -348,6 +348,7 @@ static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
  * possible).
  */
 static unsigned int ddr_min_kbps, ddr_max_kbps;
+static bool ddr_table_stock;	/* opp-avg-kBps (stock floor) instead of opp-peak-kBps */
 
 static void qcom_cpufreq_set_mem_floor(struct cpufreq_policy *policy,
 				       unsigned long freq_khz)
@@ -362,7 +363,11 @@ static void qcom_cpufreq_set_mem_floor(struct cpufreq_policy *policy,
 	opp = dev_pm_opp_find_freq_exact(dev, freq_khz * 1000, true);
 	if (IS_ERR(opp))
 		return;
-	peak = dev_pm_opp_get_bw(opp, true, 0);
+	peak = 0;
+	if (ddr_table_stock)
+		peak = dev_pm_opp_get_bw(opp, false, 0);
+	if (!peak)
+		peak = dev_pm_opp_get_bw(opp, true, 0);
 	dev_pm_opp_put(opp);
 	if (ddr_max_kbps && peak > ddr_max_kbps)
 		peak = ddr_max_kbps;
@@ -408,6 +413,34 @@ static const struct kernel_param_ops ddr_kbps_ops = {
  * (0 = none) caps it. /sys/module/qcom_cpufreq_hw/parameters/; the settings app
  * maps its performance/balanced/saver levels onto these.
  */
+static int ddr_table_set(const char *val, const struct kernel_param *kp)
+{
+	if (sysfs_streq(val, "stock"))
+		ddr_table_stock = true;
+	else if (sysfs_streq(val, "cmax"))
+		ddr_table_stock = false;
+	else
+		return -EINVAL;
+	qcom_cpufreq_revote_mem_floor();
+	return 0;
+}
+
+static int ddr_table_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%s\n", ddr_table_stock ? "stock" : "cmax");
+}
+
+static const struct kernel_param_ops ddr_table_ops = {
+	.set = ddr_table_set,
+	.get = ddr_table_get,
+};
+
+/*
+ * ddr_table: "cmax" (default) = the OPPs' opp-peak-kBps; "stock" = their
+ * opp-avg-kBps (the stock Onyx floor; falls back to peak where absent).
+ */
+module_param_cb(ddr_table, &ddr_table_ops, NULL, 0644);
+MODULE_PARM_DESC(ddr_table, "CPU DDR floor table: cmax (default) or stock");
 module_param_cb(ddr_min_kbps, &ddr_kbps_ops, &ddr_min_kbps, 0644);
 MODULE_PARM_DESC(ddr_min_kbps, "lowest CPU DDR vote while awake, kBps");
 module_param_cb(ddr_max_kbps, &ddr_kbps_ops, &ddr_max_kbps, 0644);
