@@ -2520,7 +2520,7 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	if (ret) {
 		pr_err("%s: failed to enable link clocks. ret=%d\n",
 		       __func__, ret);
-		goto fail_disable_reg;
+		goto fail_put_rpm;
 	}
 
 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
@@ -2541,6 +2541,13 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 
 fail_disable_clk:
 	cfg_hnd->ops->link_clk_disable(msm_host);
+fail_put_rpm:
+	/*
+	 * NA1: a failed link clock enable (the 14nm PLL did not lock) used to
+	 * skip this put. The leaked reference kept the DSI host, and so the
+	 * MDSS GDSC, powered for good: the PHY/PLL was never reset and every
+	 * later lock failed too (panel dead until reboot).
+	 */
 	pm_runtime_put(&msm_host->pdev->dev);
 fail_disable_reg:
 	regulator_bulk_disable(msm_host->cfg_hnd->cfg->num_regulators,

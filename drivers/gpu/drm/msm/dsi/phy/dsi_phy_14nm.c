@@ -554,6 +554,8 @@ static int dsi_pll_14nm_vco_prepare(struct clk_hw *hw)
 
 	if (unlikely(!locked)) {
 		DRM_DEV_ERROR(&pll_14nm->phy->pdev->dev, "DSI PLL lock failed\n");
+		/* NA1: off again, the next prepare starts from a clean 0->1 */
+		writel(0, cmn_base + REG_DSI_14nm_PHY_CMN_PLL_CNTRL);
 		return -EINVAL;
 	}
 
