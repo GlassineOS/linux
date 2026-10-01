@@ -347,6 +347,8 @@ static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
  * only, so it never holds the RPM sleep set: suspend and XO shutdown stay
  * possible).
  */
+static unsigned int ddr_min_kbps, ddr_max_kbps;
+
 static void qcom_cpufreq_set_mem_floor(struct cpufreq_policy *policy,
 				       unsigned long freq_khz)
 {
@@ -362,8 +364,54 @@ static void qcom_cpufreq_set_mem_floor(struct cpufreq_policy *policy,
 		return;
 	peak = dev_pm_opp_get_bw(opp, true, 0);
 	dev_pm_opp_put(opp);
+	if (ddr_max_kbps && peak > ddr_max_kbps)
+		peak = ddr_max_kbps;
+	if (peak < ddr_min_kbps)
+		peak = ddr_min_kbps;
 	icc_set_bw(data->mem_path, 0, peak);
 }
+
+/* Re-vote every policy's DDR floor at its current frequency */
+static void qcom_cpufreq_revote_mem_floor(void)
+{
+	struct cpufreq_policy *policy;
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		if (policy->cpu == cpu && policy->driver_data &&
+		    ((struct qcom_cpufreq_data *)policy->driver_data)->mem_path)
+			qcom_cpufreq_set_mem_floor(policy, policy->cur);
+		cpufreq_cpu_put(policy);
+	}
+}
+
+static int ddr_kbps_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (!ret)
+		qcom_cpufreq_revote_mem_floor();
+	return ret;
+}
+
+static const struct kernel_param_ops ddr_kbps_ops = {
+	.set = ddr_kbps_set,
+	.get = param_get_uint,
+};
+
+/*
+ * NA1: clamp the DDR floor at runtime (kBps, active-only like the vote):
+ * ddr_min_kbps raises every vote (e.g. 5163000 = full DDR while awake), ddr_max_kbps
+ * (0 = none) caps it. /sys/module/qcom_cpufreq_hw/parameters/; the settings app
+ * maps its performance/balanced/saver levels onto these.
+ */
+module_param_cb(ddr_min_kbps, &ddr_kbps_ops, &ddr_min_kbps, 0644);
+MODULE_PARM_DESC(ddr_min_kbps, "lowest CPU DDR vote while awake, kBps");
+module_param_cb(ddr_max_kbps, &ddr_kbps_ops, &ddr_max_kbps, 0644);
+MODULE_PARM_DESC(ddr_max_kbps, "highest CPU DDR vote, kBps (0: no cap)");
 
 static unsigned int qcom_cpufreq_get_freq(struct cpufreq_policy *policy);
 
