@@ -1511,6 +1511,7 @@ static const struct qcom_icc_desc sdm660_a2noc = {
 	.nodes = sdm660_a2noc_nodes,
 	.num_nodes = ARRAY_SIZE(sdm660_a2noc_nodes),
 	.bus_clk_desc = &aggre2_clk,
+	.keep_alive = true,
 	.intf_clocks = a2noc_intf_clocks,
 	.num_intf_clocks = ARRAY_SIZE(a2noc_intf_clocks),
 	.regmap_cfg = &sdm660_a2noc_regmap_config,
@@ -1540,6 +1541,7 @@ static const struct qcom_icc_desc sdm660_bimc = {
 	.nodes = sdm660_bimc_nodes,
 	.num_nodes = ARRAY_SIZE(sdm660_bimc_nodes),
 	.bus_clk_desc = &bimc_clk,
+	.keep_alive = true,
 	.regmap_cfg = &sdm660_bimc_regmap_config,
 	.ab_coeff = 153,
 };
@@ -1596,6 +1598,7 @@ static const struct qcom_icc_desc sdm660_cnoc = {
 	.nodes = sdm660_cnoc_nodes,
 	.num_nodes = ARRAY_SIZE(sdm660_cnoc_nodes),
 	.bus_clk_desc = &bus_2_clk,
+	.keep_alive = true,
 	.regmap_cfg = &sdm660_cnoc_regmap_config,
 };
 
@@ -1658,6 +1661,7 @@ static const struct qcom_icc_desc sdm660_mnoc = {
 	.nodes = sdm660_mnoc_nodes,
 	.num_nodes = ARRAY_SIZE(sdm660_mnoc_nodes),
 	.bus_clk_desc = &mmaxi_0_clk,
+	.keep_alive = true,
 	.intf_clocks = mm_intf_clocks,
 	.num_intf_clocks = ARRAY_SIZE(mm_intf_clocks),
 	.regmap_cfg = &sdm660_mnoc_regmap_config,
@@ -1697,6 +1701,7 @@ static const struct qcom_icc_desc sdm660_snoc = {
 	.nodes = sdm660_snoc_nodes,
 	.num_nodes = ARRAY_SIZE(sdm660_snoc_nodes),
 	.bus_clk_desc = &bus_1_clk,
+	.keep_alive = true,
 	.regmap_cfg = &sdm660_snoc_regmap_config,
 };
 
