@@ -28,6 +28,14 @@ struct qcom_rpm_reg {
 	unsigned int enabled_updated:1;
 	unsigned int uv_updated:1;
 	unsigned int load_updated:1;
+
+	/*
+	 * NA1: qcom,sleep-load-microamp present = also vote the RPM sleep set
+	 * (enable + uV as active, this load). Without a sleep-set vote the
+	 * RPM keeps the active one asleep: a forced HPM load stays HPM.
+	 */
+	bool sleep_set;
+	u32 sleep_load;
 };
 
 struct rpm_regulator_req {
@@ -73,6 +81,27 @@ static int rpm_reg_write_active(struct qcom_rpm_reg *vreg)
 	ret = qcom_rpm_smd_write(smd_vreg_rpm, QCOM_SMD_RPM_ACTIVE_STATE,
 				 vreg->type, vreg->id,
 				 req, sizeof(req[0]) * reqlen);
+	if (!ret && vreg->sleep_set) {
+		struct rpm_regulator_req sreq[3];
+		int n = 0;
+
+		sreq[n].key = cpu_to_le32(RPM_KEY_SWEN);
+		sreq[n].nbytes = cpu_to_le32(sizeof(u32));
+		sreq[n++].value = cpu_to_le32(vreg->is_enabled);
+		if (vreg->is_enabled && vreg->uV) {
+			sreq[n].key = cpu_to_le32(RPM_KEY_UV);
+			sreq[n].nbytes = cpu_to_le32(sizeof(u32));
+			sreq[n++].value = cpu_to_le32(vreg->uV);
+		}
+		if (vreg->is_enabled) {
+			sreq[n].key = cpu_to_le32(RPM_KEY_MA);
+			sreq[n].nbytes = cpu_to_le32(sizeof(u32));
+			sreq[n++].value = cpu_to_le32(vreg->sleep_load / 1000);
+		}
+		ret = qcom_rpm_smd_write(smd_vreg_rpm, QCOM_SMD_RPM_SLEEP_STATE,
+					 vreg->type, vreg->id,
+					 sreq, sizeof(sreq[0]) * n);
+	}
 	if (!ret) {
 		vreg->enabled_updated = 0;
 		vreg->uv_updated = 0;
@@ -1512,6 +1541,8 @@ static int rpm_regulator_init_vreg(struct qcom_rpm_reg *vreg, struct device *dev
 	vreg->dev	= dev;
 	vreg->type	= rpm_data->type;
 	vreg->id	= rpm_data->id;
+	vreg->sleep_set	= !of_property_read_u32(node, "qcom,sleep-load-microamp",
+						&vreg->sleep_load);
 
 	memcpy(&vreg->desc, rpm_data->desc, sizeof(vreg->desc));
 	vreg->desc.name = rpm_data->name;
