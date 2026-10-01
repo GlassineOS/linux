@@ -166,6 +166,7 @@ struct clk_smd_rpm {
 	const bool active_only;
 	bool enabled;
 	bool branch;
+	bool handoff;	/* NA1: the boot handoff vote stands (no consumer yet) */
 	struct clk_smd_rpm *peer;
 	struct clk_hw hw;
 	unsigned long rate;
@@ -263,6 +264,8 @@ static int clk_smd_rpm_prepare(struct clk_hw *hw)
 	int ret = 0;
 
 	mutex_lock(&rpm_smd_clk_lock);
+
+	r->handoff = false;	/* a consumer owns the votes from here on */
 
 	/* Don't send requests to the RPM if the rate has not been set. */
 	if (!r->rate)
@@ -412,9 +415,47 @@ static int clk_smd_rpm_enable_scaling(void)
 	return 0;
 }
 
+/*
+ * NA1: the handoff votes every RPM clock on in the active AND the sleep set,
+ * and a clock no consumer ever prepares was never voted again: unused XO
+ * buffers (ln_bb_clk1-3, rf_clk1, div_clk1) stayed on asleep and the RPM could
+ * not shut XO (vlow 0). Report the handoff as "prepared" so clk_disable_unused
+ * reaches it, then drop only the SLEEP-set vote (the peer's, if it is
+ * prepared): awake, anything not modelled in DT keeps its clock.
+ */
+static int clk_smd_rpm_is_prepared(struct clk_hw *hw)
+{
+	struct clk_smd_rpm *r = to_clk_smd_rpm(hw);
+
+	return r->handoff || r->enabled;
+}
+
+static void clk_smd_rpm_unprepare_unused(struct clk_hw *hw)
+{
+	struct clk_smd_rpm *r = to_clk_smd_rpm(hw);
+	struct clk_smd_rpm *peer = r->peer;
+	unsigned long peer_rate = 0, peer_sleep_rate = 0, sleep_rate;
+	int ret;
+
+	guard(mutex)(&rpm_smd_clk_lock);
+
+	if (!r->handoff || r->enabled)
+		return;
+	r->handoff = false;
+
+	if (peer->enabled)
+		to_active_sleep(peer, peer->rate, &peer_rate, &peer_sleep_rate);
+	sleep_rate = r->branch ? !!peer_sleep_rate : peer_sleep_rate;
+	ret = clk_smd_rpm_set_rate_sleep(r, sleep_rate);
+	pr_info("clk-smd-rpm: %s unused: sleep vote %lu (%d)\n",
+		clk_hw_get_name(hw), sleep_rate, ret);
+}
+
 static const struct clk_ops clk_smd_rpm_ops = {
 	.prepare	= clk_smd_rpm_prepare,
 	.unprepare	= clk_smd_rpm_unprepare,
+	.is_prepared	= clk_smd_rpm_is_prepared,
+	.unprepare_unused = clk_smd_rpm_unprepare_unused,
 	.set_rate	= clk_smd_rpm_set_rate,
 	.determine_rate = clk_determine_rate_noop,
 	.recalc_rate	= clk_smd_rpm_recalc_rate,
@@ -423,6 +464,8 @@ static const struct clk_ops clk_smd_rpm_ops = {
 static const struct clk_ops clk_smd_rpm_branch_ops = {
 	.prepare	= clk_smd_rpm_prepare,
 	.unprepare	= clk_smd_rpm_unprepare,
+	.is_prepared	= clk_smd_rpm_is_prepared,
+	.unprepare_unused = clk_smd_rpm_unprepare_unused,
 	.recalc_rate	= clk_smd_rpm_recalc_rate,
 };
 
@@ -1365,6 +1408,7 @@ static int rpm_smd_clk_probe(struct platform_device *pdev)
 		ret = clk_smd_rpm_handoff(rpm_smd_clks[i]);
 		if (ret)
 			goto err;
+		rpm_smd_clks[i]->handoff = true;
 	}
 
 	for (i = 0; i < desc->num_icc_clks; i++) {
