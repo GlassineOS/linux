@@ -52,6 +52,22 @@ struct apr_rx_buf {
  *
  * Return: Will be an negative on packet size on success.
  */
+/*
+ * NA1 debug: log the first na1_trace APR packets each way (the ADSP stayed
+ * awake after PipeWire's startup probe; which session was left open?).
+ * Counts down; write a new count to /sys/module/apr/parameters/na1_trace.
+ */
+static int na1_trace = 500;
+module_param(na1_trace, int, 0644);
+
+static bool na1_trace_one(void)
+{
+	if (READ_ONCE(na1_trace) <= 0)
+		return false;
+	WRITE_ONCE(na1_trace, READ_ONCE(na1_trace) - 1);
+	return true;
+}
+
 int apr_send_pkt(struct apr_device *adev, struct apr_pkt *pkt)
 {
 	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
@@ -69,6 +85,17 @@ int apr_send_pkt(struct apr_device *adev, struct apr_pkt *pkt)
 
 	ret = rpmsg_trysend(apr->ch, pkt, hdr->pkt_size);
 	spin_unlock_irqrestore(&adev->svc.lock, flags);
+
+	if (na1_trace_one()) {
+		/* first payload words: AFE port id, ADM/ASM open parameters */
+		const u32 *pl = (const void *)pkt + APR_HDR_SIZE;
+		u32 w0 = hdr->pkt_size >= APR_HDR_SIZE + 4 ? pl[0] : 0;
+		u32 w1 = hdr->pkt_size >= APR_HDR_SIZE + 8 ? pl[1] : 0;
+
+		pr_info("na1-apr tx svc %u port %u op 0x%x token 0x%x len %u pl %08x %08x ret %d\n",
+			hdr->dest_svc, hdr->dest_port, hdr->opcode, hdr->token,
+			hdr->pkt_size, w0, w1, ret);
+	}
 
 	return ret ? ret : hdr->pkt_size;
 }
@@ -227,6 +254,17 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 			hdr->dest_svc >= APR_SVC_MAX) {
 		dev_err(apr->dev, "APR: Wrong APR header\n");
 		return -EINVAL;
+	}
+
+	if (na1_trace_one()) {
+		const u32 *pl = buf + hdr_size;
+
+		if (hdr->opcode == APR_BASIC_RSP_RESULT && len >= hdr_size + 8)
+			pr_info("na1-apr rx svc %u port %u rsp op 0x%x status 0x%x token 0x%x\n",
+				hdr->src_svc, hdr->src_port, pl[0], pl[1], hdr->token);
+		else
+			pr_info("na1-apr rx svc %u port %u op 0x%x token 0x%x len %d\n",
+				hdr->src_svc, hdr->src_port, hdr->opcode, hdr->token, len);
 	}
 
 	svc_id = hdr->dest_svc;
