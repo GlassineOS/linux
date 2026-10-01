@@ -43,6 +43,8 @@ struct msm_dsi {
 
 	struct device *phy_dev;
 	bool phy_enabled;
+	/* NA1: pre_enable powered the link up (post_disable undoes only that) */
+	bool link_powered;
 
 	int id;
 };
