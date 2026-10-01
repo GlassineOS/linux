@@ -1717,6 +1717,12 @@ static struct platform_driver sdm660_noc_driver = {
 	.driver = {
 		.name = "qnoc-sdm660",
 		.of_match_table = sdm660_noc_of_match,
+		/*
+		 * NA1: without it the boot-time INT_MAX bandwidth of every node
+		 * was never dropped (in the RPM sleep set too): bus/DDR clocks
+		 * pinned, and the RPM never shut XO (no vlow/vmin).
+		 */
+		.sync_state = icc_sync_state,
 	},
 };
 module_platform_driver(sdm660_noc_driver);
