@@ -204,6 +204,7 @@ struct cyttsp5 {
 	struct input_dev *input;
 	char phys[NAME_MAX];
 	int num_prv_rec;
+	int irq;
 	struct regmap *regmap;
 	struct touchscreen_properties prop;
 	struct regulator_bulk_data supplies[2];
@@ -635,6 +636,15 @@ static int cyttsp5_power_control(struct cyttsp5 *ts, bool on)
 	SET_CMD_REPORT_ID(cmd[0], state);
 	SET_CMD_OPCODE(cmd[1], HID_CMD_SET_POWER);
 
+	/*
+	 * NA1: a stray frame (empty, or a late response) left cmd_done one
+	 * ahead, so every later power command returned at once with the
+	 * previous command's answer ("sleep response failed (05 00 f0 00 88)"
+	 * = the wakeup's state 0, and the other way round at resume).
+	 */
+	reinit_completion(&ts->cmd_done);
+	memset(ts->response_buf, 0, 5);
+
 	rc = cyttsp5_write(ts, HID_COMMAND_REG, cmd, sizeof(cmd));
 	if (rc) {
 		dev_err(ts->dev, "Failed to write power command %d", rc);
@@ -938,6 +948,7 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 	/* Need a delay to have device up */
 	msleep(20);
 
+	ts->irq = irq;
 	error = devm_request_threaded_irq(dev, irq, NULL, cyttsp5_handle_irq,
 					  IRQF_ONESHOT, name, ts);
 	if (error) {
@@ -997,6 +1008,20 @@ MODULE_DEVICE_TABLE(i2c, cyttsp5_i2c_id);
 static int __maybe_unused cyttsp5_suspend(struct device *dev)
 {
 	struct cyttsp5 *ts = dev_get_drvdata(dev);
+
+	/*
+	 * NA1: release every contact. A finger down when the suspend started
+	 * (the hand holding the device) was never released: after resume the
+	 * next touch reused its slot and tracking id, so userspace saw the old
+	 * contact move and placed the tap where the hand had been (a phantom
+	 * tap, 10-01). The IRQ is masked only around the release (its threaded
+	 * handler reports frames), not across the sleep command (0015 v1).
+	 */
+	disable_irq(ts->irq);
+	input_mt_sync_frame(ts->input);
+	input_sync(ts->input);
+	ts->num_prv_rec = 0;
+	enable_irq(ts->irq);
 
 	if (!device_may_wakeup(dev))
 		cyttsp5_power_control(ts, false);
