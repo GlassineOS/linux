@@ -129,6 +129,26 @@ MODULE_PARM_DESC(mx_level, "RPM VDDMX level held while the link is up (0 = none,
 static unsigned int mx_voted;
 module_param(mx_voted, uint, 0444);
 MODULE_PARM_DESC(mx_voted, "VDDMX level held right now");
+/*
+ * More holds while the link is up, for the same stall (2026-10-02, after the
+ * s5a voltage vote alone did not fix it: s5 stayed at 1.328 V and the PLL still
+ * died when an l6a consumer went off within ~5 ms of its lock):
+ *  - hold_rfclk: keep the WCN RF clock buffer (RPM_SMD_RF_CLK1_PIN, the one
+ *    ath10k votes) on, so WiFi going off does not switch it during a lock;
+ *  - rail_load_ua: a load vote on s5a and s2b (the parents of the DSI LDOs
+ *    l1a and l1b, and of the WCN rails) so the RPM keeps them in PWM instead
+ *    of AUTO, and a load that disappears from them does not step the buck.
+ * Both read at every prepare; held shows what is held (1 rfclk, 2 s5a, 4 s2b).
+ */
+static bool hold_rfclk;
+module_param(hold_rfclk, bool, 0644);
+MODULE_PARM_DESC(hold_rfclk, "hold the WCN RF clock buffer on while the link is up");
+static unsigned int rail_load_ua;
+module_param(rail_load_ua, uint, 0644);
+MODULE_PARM_DESC(rail_load_ua, "load vote on s5a + s2b while the link is up (uA, 0 = none)");
+static unsigned int held;
+module_param(held, uint, 0444);
+MODULE_PARM_DESC(held, "held right now: 1 rfclk, 2 s5a load, 4 s2b load");
 
 #define TC_SLEEP	0x047c
 #define TC_IDREG	0x04a0
@@ -165,6 +185,8 @@ struct na1_link {
 	struct i2c_client *tc, *pmic;
 	struct gpio_desc *osc, *mode0, *reset, *vddc, *pwrgood;
 	struct regulator *vdd1v8, *vddio, *v3p3;
+	struct regulator *s5a, *s2b;	/* parents of the DSI LDOs (optional, for rail_load_ua) */
+	struct clk *rfclk;		/* WCN RF clock buffer (optional, for hold_rfclk) */
 	struct clk *pclk, *byte;	/* the DSI host's link clocks (optional) */
 	struct device *mx;		/* virtual device of the VDDMX domain (optional) */
 	struct mutex lock;		/* rails */
@@ -469,15 +491,60 @@ static void na1_mx_unvote(struct na1_link *ctx)
 	mx_voted = 0;
 }
 
+static void na1_hold_rail(struct na1_link *ctx, struct regulator *reg, unsigned int bit,
+			  unsigned int load)
+{
+	if (!reg)
+		return;
+	if (regulator_set_load(reg, load) || regulator_enable(reg)) {
+		dev_warn_ratelimited(ctx->dev, "rail load hold %u failed\n", bit);
+		regulator_set_load(reg, 0);
+		return;
+	}
+	held |= bit;
+}
+
+static void na1_hold(struct na1_link *ctx)
+{
+	unsigned int load = READ_ONCE(rail_load_ua);
+
+	if (held)
+		return;
+	if (READ_ONCE(hold_rfclk) && ctx->rfclk && !clk_prepare_enable(ctx->rfclk))
+		held |= 1;
+	if (load) {
+		na1_hold_rail(ctx, ctx->s5a, 2, load);
+		na1_hold_rail(ctx, ctx->s2b, 4, load);
+	}
+}
+
+static void na1_release(struct na1_link *ctx)
+{
+	if (held & 4) {
+		regulator_disable(ctx->s2b);
+		regulator_set_load(ctx->s2b, 0);
+	}
+	if (held & 2) {
+		regulator_disable(ctx->s5a);
+		regulator_set_load(ctx->s5a, 0);
+	}
+	if (held & 1)
+		clk_disable_unprepare(ctx->rfclk);
+	held = 0;
+}
+
 static int na1_link_prepare(struct drm_panel *panel)
 {
 	struct na1_link *ctx = container_of(panel, struct na1_link, panel);
 	int ret;
 
+	na1_hold(ctx);
 	na1_mx_vote(ctx);
 	ret = na1_bridge_up(ctx);
-	if (ret)
+	if (ret) {
 		na1_mx_unvote(ctx);
+		na1_release(ctx);
+	}
 	return ret;
 }
 
@@ -546,6 +613,7 @@ static int na1_link_unprepare(struct drm_panel *panel)
 
 	na1_bridge_down(ctx);
 	na1_mx_unvote(ctx);
+	na1_release(ctx);
 	return 0;
 }
 
@@ -634,6 +702,21 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 		dev_warn(dev, "no DSI link clocks in DT: HV is not gated on the link\n");
 	if (IS_ERR(ctx->vdd1v8) || IS_ERR(ctx->vddio) || IS_ERR(ctx->v3p3))
 		return dev_err_probe(dev, -EPROBE_DEFER, "supplies\n");
+	ctx->rfclk = devm_clk_get_optional(dev, "rfclk");
+	if (IS_ERR(ctx->rfclk))
+		return dev_err_probe(dev, PTR_ERR(ctx->rfclk), "RF clock\n");
+	ctx->s5a = devm_regulator_get_optional(dev, "s5a");
+	if (IS_ERR(ctx->s5a)) {
+		if (PTR_ERR(ctx->s5a) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(ctx->s5a), "s5a\n");
+		ctx->s5a = NULL;
+	}
+	ctx->s2b = devm_regulator_get_optional(dev, "s2b");
+	if (IS_ERR(ctx->s2b)) {
+		if (PTR_ERR(ctx->s2b) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(ctx->s2b), "s2b\n");
+		ctx->s2b = NULL;
+	}
 	ctx->mx = dev_pm_domain_attach_by_name(dev, "mx");
 	if (IS_ERR(ctx->mx))
 		return dev_err_probe(dev, PTR_ERR(ctx->mx), "MX power domain\n");
@@ -670,6 +753,7 @@ static void na1_link_remove(struct mipi_dsi_device *dsi)
 	na1_rails_down(ctx);
 	mutex_unlock(&ctx->lock);
 	na1_bridge_down(ctx);
+	na1_release(ctx);
 	mipi_dsi_detach(dsi);
 	drm_panel_remove(&ctx->panel);
 }
