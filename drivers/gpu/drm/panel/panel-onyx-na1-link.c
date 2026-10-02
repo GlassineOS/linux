@@ -79,6 +79,8 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/workqueue.h>
 
@@ -110,6 +112,23 @@ MODULE_PARM_DESC(temperature, "MAX17135 reg 0x00 (deg C) at the last rails-up; -
 static bool hv_on;
 module_param(hv_on, bool, 0444);
 MODULE_PARM_DESC(hv_on, "rails currently up");
+/*
+ * VDDMX vote while the link is up (2026-10-02, the power-key display stall):
+ * four times the DSI PLL died under a running link after the device had sat
+ * idle (pclk0/byte0 "stuck at on" at power-off = no source), never in 64
+ * scripted rounds with the SoC kept busy. Nothing on the APSS votes MX (genpd
+ * mx/mx_ao/mx_vfl all off-0), so its corner is whatever the other RPM masters
+ * want, and the PLLs' digital side sits on it. The DT gives this device the
+ * active-only MX domain; from prepare (before the DSI host powers the lanes)
+ * to unprepare it holds this RPM level (RPM_SMD_LEVEL_*: 128 SVS, 256 NOM;
+ * 0 = no vote). Read at every prepare, so it can be A/B'd live.
+ */
+static unsigned int mx_level;
+module_param(mx_level, uint, 0644);
+MODULE_PARM_DESC(mx_level, "RPM VDDMX level held while the link is up (0 = none, 128 svs, 256 nom)");
+static unsigned int mx_voted;
+module_param(mx_voted, uint, 0444);
+MODULE_PARM_DESC(mx_voted, "VDDMX level held right now");
 
 #define TC_SLEEP	0x047c
 #define TC_IDREG	0x04a0
@@ -147,6 +166,7 @@ struct na1_link {
 	struct gpio_desc *osc, *mode0, *reset, *vddc, *pwrgood;
 	struct regulator *vdd1v8, *vddio, *v3p3;
 	struct clk *pclk, *byte;	/* the DSI host's link clocks (optional) */
+	struct device *mx;		/* virtual device of the VDDMX domain (optional) */
 	struct mutex lock;		/* rails */
 	struct delayed_work hv_timeout;
 	bool bridge_up, rails_up;
@@ -419,9 +439,46 @@ static int na1_link_get_modes(struct drm_panel *panel, struct drm_connector *con
 	return drm_connector_helper_get_modes_fixed(connector, &m);
 }
 
+static void na1_mx_vote(struct na1_link *ctx)
+{
+	unsigned int level = READ_ONCE(mx_level);
+	int ret;
+
+	if (!ctx->mx || !level || mx_voted)
+		return;
+	ret = pm_runtime_resume_and_get(ctx->mx);
+	if (ret) {
+		dev_warn_ratelimited(ctx->dev, "MX domain on: %d\n", ret);
+		return;
+	}
+	ret = dev_pm_genpd_set_performance_state(ctx->mx, level);
+	if (ret) {
+		dev_warn_ratelimited(ctx->dev, "MX level %u: %d\n", level, ret);
+		pm_runtime_put(ctx->mx);
+		return;
+	}
+	mx_voted = level;
+}
+
+static void na1_mx_unvote(struct na1_link *ctx)
+{
+	if (!mx_voted)
+		return;
+	dev_pm_genpd_set_performance_state(ctx->mx, 0);
+	pm_runtime_put(ctx->mx);
+	mx_voted = 0;
+}
+
 static int na1_link_prepare(struct drm_panel *panel)
 {
-	return na1_bridge_up(container_of(panel, struct na1_link, panel));
+	struct na1_link *ctx = container_of(panel, struct na1_link, panel);
+	int ret;
+
+	na1_mx_vote(ctx);
+	ret = na1_bridge_up(ctx);
+	if (ret)
+		na1_mx_unvote(ctx);
+	return ret;
 }
 
 /* the DSI link is really up: link clocks running, pclk at the mode's rate */
@@ -485,7 +542,10 @@ static int na1_link_disable(struct drm_panel *panel)
 
 static int na1_link_unprepare(struct drm_panel *panel)
 {
-	na1_bridge_down(container_of(panel, struct na1_link, panel));
+	struct na1_link *ctx = container_of(panel, struct na1_link, panel);
+
+	na1_bridge_down(ctx);
+	na1_mx_unvote(ctx);
 	return 0;
 }
 
@@ -507,6 +567,14 @@ static struct i2c_client *na1_get_client(struct device *dev, const char *prop)
 	c = of_find_i2c_device_by_node(np);
 	of_node_put(np);
 	return c ? c : ERR_PTR(-EPROBE_DEFER);
+}
+
+static void na1_mx_detach(void *data)
+{
+	struct na1_link *ctx = data;
+
+	na1_mx_unvote(ctx);
+	dev_pm_domain_detach(ctx->mx, true);
 }
 
 static void na1_put_clients(void *data)
@@ -566,6 +634,14 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 		dev_warn(dev, "no DSI link clocks in DT: HV is not gated on the link\n");
 	if (IS_ERR(ctx->vdd1v8) || IS_ERR(ctx->vddio) || IS_ERR(ctx->v3p3))
 		return dev_err_probe(dev, -EPROBE_DEFER, "supplies\n");
+	ctx->mx = dev_pm_domain_attach_by_name(dev, "mx");
+	if (IS_ERR(ctx->mx))
+		return dev_err_probe(dev, PTR_ERR(ctx->mx), "MX power domain\n");
+	if (ctx->mx) {
+		ret = devm_add_action_or_reset(dev, na1_mx_detach, ctx);
+		if (ret)
+			return ret;
+	}
 
 	dsi->lanes = 2;
 	dsi->format = MIPI_DSI_FMT_RGB888;
