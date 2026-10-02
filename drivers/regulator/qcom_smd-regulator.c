@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/driver.h>
@@ -158,6 +159,52 @@ static int rpm_reg_set_load(struct regulator_dev *rdev, int load_uA)
 
 	return ret;
 }
+
+/*
+ * NA1 diagnostic (2026-10-02, the power-key display stall): force the RPM's
+ * SMPS mode of s5a and s2b (the parents of the DSI LDOs l1a/l1b and of the WCN
+ * rails) to PWM, active set only (no effect while the APSS sleeps). Their
+ * load vote does not do it: with 1 A voted both stayed in AUTO. Writing the
+ * param sends the request at once; 1 = PWM, 0 = AUTO (RPM SMPS mode key
+ * "ssmd": 0 auto, 1 ipeak, 2 pwm). Not touched otherwise.
+ */
+#define RPM_KEY_SMPS_MODE	0x646d7373 /* "ssmd" */
+
+static bool na1_smps_pwm;
+
+static int na1_smps_pwm_set(const char *val, const struct kernel_param *kp)
+{
+	static const struct { u32 type, id; } rails[] = {
+		{ QCOM_SMD_RPM_SMPA, 5 }, { QCOM_SMD_RPM_SMPB, 2 },
+	};
+	struct rpm_regulator_req req;
+	bool on;
+	int i, ret;
+
+	ret = kstrtobool(val, &on);
+	if (ret)
+		return ret;
+	if (!smd_vreg_rpm)
+		return -EPROBE_DEFER;
+	req.key = cpu_to_le32(RPM_KEY_SMPS_MODE);
+	req.nbytes = cpu_to_le32(sizeof(u32));
+	req.value = cpu_to_le32(on ? 2 : 0);
+	for (i = 0; i < ARRAY_SIZE(rails); i++) {
+		ret = qcom_rpm_smd_write(smd_vreg_rpm, QCOM_SMD_RPM_ACTIVE_STATE,
+					 rails[i].type, rails[i].id, &req, sizeof(req));
+		if (ret)
+			return ret;
+	}
+	na1_smps_pwm = on;
+	return 0;
+}
+
+static const struct kernel_param_ops na1_smps_pwm_ops = {
+	.set = na1_smps_pwm_set,
+	.get = param_get_bool,
+};
+module_param_cb(na1_smps_pwm, &na1_smps_pwm_ops, &na1_smps_pwm, 0644);
+MODULE_PARM_DESC(na1_smps_pwm, "NA1 diagnostic: s5a + s2b in PWM (active set)");
 
 static const struct regulator_ops rpm_smps_ldo_ops = {
 	.enable = rpm_reg_enable,
