@@ -1880,12 +1880,14 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 	nr_rings = 4;
 
 	/*
-	 * A509 (NA1): one ring, no preemption. Nothing here needs priority
-	 * rings, and the CP ran on a stale rptr after the 09-29 recovery
-	 * (rb 0135/0036, rptr past wptr): one ring removes the preemption
-	 * state from the recovery path.
+	 * A509 (NA1): the upstream four rings. Preemption needs WHERE_AM_I
+	 * microcode (linux-firmware's a530_pfp 0x5ff08a); Onyx's vendor copy
+	 * (0x5ff112) lacks the marker, so a5xx_ucode_load falls back to one
+	 * ring by itself, which is all the earlier A509 override ever did:
+	 * preemption never ran with it, and the 09-29 stale rptr was the CP
+	 * surviving a resume (the soft reset in hw_init).
 	 */
-	if (config->info->revn == 510 || config->info->revn == 509)
+	if (config->info->revn == 510)
 		nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);
