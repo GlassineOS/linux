@@ -146,9 +146,32 @@ MODULE_PARM_DESC(hold_rfclk, "hold the WCN RF clock buffer on while the link is 
 static unsigned int rail_load_ua;
 module_param(rail_load_ua, uint, 0644);
 MODULE_PARM_DESC(rail_load_ua, "load vote on s5a + s2b while the link is up (uA, 0 = none)");
+/*
+ * The traced stall (2026-10-02, wf-trace): the PLL locks fine; ~280 ms into the
+ * link ath10k powers the WCN down (rf_clk1 off, then l19, l6, l9, l5 within
+ * 2.4 ms) and the frame in flight never completes. hold_wcn keeps the chosen
+ * WCN rails enabled from prepare to unprepare (bitmask: 8 l5 cx/mx, 16 l9 xo,
+ * 32 l6 rf, 64 l19 3.3 V), each with wcn_load_ua (0 = no load vote), so a
+ * WiFi/BT power-down during a link does not switch them off. Bisect in the
+ * WCN's own power-down order: hold l5 before l9 before l6 before l19 (8, 24,
+ * 56, 120), never a rail without the ones under it.
+ */
+/*
+ * Diagnostic, default off. The bisect on b93cf7c6 (120 and 56 clean, 24 and 8
+ * stalled) found l6 switching off mid-link; the cause was the DT: the DSI vdda
+ * is l6 on this board (stock vdda-1p2-supply), we had it on l1a.
+ */
+static unsigned int hold_wcn;
+module_param(hold_wcn, uint, 0644);
+MODULE_PARM_DESC(hold_wcn, "WCN rails held while the link is up: 8 l5, 16 l9, 32 l6, 64 l19");
+static unsigned int wcn_load_ua;
+module_param(wcn_load_ua, uint, 0644);
+MODULE_PARM_DESC(wcn_load_ua, "load vote on each held WCN rail (uA)");
 static unsigned int held;
 module_param(held, uint, 0444);
-MODULE_PARM_DESC(held, "held right now: 1 rfclk, 2 s5a load, 4 s2b load");
+MODULE_PARM_DESC(held, "held right now: 1 rfclk, 2 s5a load, 4 s2b load, 8 l5, 16 l9, 32 l6, 64 l19");
+
+static const char * const wcn_supply[] = { "wcn-l5", "wcn-l9", "wcn-l6", "wcn-l19" };
 
 #define TC_SLEEP	0x047c
 #define TC_IDREG	0x04a0
@@ -187,6 +210,7 @@ struct na1_link {
 	struct regulator *vdd1v8, *vddio, *v3p3;
 	struct regulator *s5a, *s2b;	/* parents of the DSI LDOs (optional, for rail_load_ua) */
 	struct clk *rfclk;		/* WCN RF clock buffer (optional, for hold_rfclk) */
+	struct regulator *wcn[4];	/* WCN rails, wcn_supply[] order (optional, for hold_wcn) */
 	struct clk *pclk, *byte;	/* the DSI host's link clocks (optional) */
 	struct device *mx;		/* virtual device of the VDDMX domain (optional) */
 	struct mutex lock;		/* rails */
@@ -506,7 +530,8 @@ static void na1_hold_rail(struct na1_link *ctx, struct regulator *reg, unsigned 
 
 static void na1_hold(struct na1_link *ctx)
 {
-	unsigned int load = READ_ONCE(rail_load_ua);
+	unsigned int load = READ_ONCE(rail_load_ua), mask;
+	int i;
 
 	if (held)
 		return;
@@ -516,10 +541,22 @@ static void na1_hold(struct na1_link *ctx)
 		na1_hold_rail(ctx, ctx->s5a, 2, load);
 		na1_hold_rail(ctx, ctx->s2b, 4, load);
 	}
+	mask = READ_ONCE(hold_wcn);
+	load = READ_ONCE(wcn_load_ua);
+	for (i = 0; i < ARRAY_SIZE(ctx->wcn); i++)
+		if (mask & (8 << i))
+			na1_hold_rail(ctx, ctx->wcn[i], 8 << i, load);
 }
 
 static void na1_release(struct na1_link *ctx)
 {
+	int i;
+
+	for (i = ARRAY_SIZE(ctx->wcn) - 1; i >= 0; i--)
+		if (held & (8 << i)) {
+			regulator_disable(ctx->wcn[i]);
+			regulator_set_load(ctx->wcn[i], 0);
+		}
 	if (held & 4) {
 		regulator_disable(ctx->s2b);
 		regulator_set_load(ctx->s2b, 0);
@@ -657,7 +694,7 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 {
 	struct device *dev = &dsi->dev;
 	struct na1_link *ctx;
-	int ret;
+	int i, ret;
 
 	ctx = devm_drm_panel_alloc(dev, struct na1_link, panel, &na1_link_funcs,
 				   DRM_MODE_CONNECTOR_DSI);
@@ -716,6 +753,14 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 		if (PTR_ERR(ctx->s2b) != -ENODEV)
 			return dev_err_probe(dev, PTR_ERR(ctx->s2b), "s2b\n");
 		ctx->s2b = NULL;
+	}
+	for (i = 0; i < ARRAY_SIZE(ctx->wcn); i++) {
+		ctx->wcn[i] = devm_regulator_get_optional(dev, wcn_supply[i]);
+		if (IS_ERR(ctx->wcn[i])) {
+			if (PTR_ERR(ctx->wcn[i]) != -ENODEV)
+				return dev_err_probe(dev, PTR_ERR(ctx->wcn[i]), "%s\n", wcn_supply[i]);
+			ctx->wcn[i] = NULL;
+		}
 	}
 	ctx->mx = dev_pm_domain_attach_by_name(dev, "mx");
 	if (IS_ERR(ctx->mx))
