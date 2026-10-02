@@ -215,6 +215,15 @@ static int qcom_icc_rpm_set(struct qcom_icc_node *qn, u64 *bw, bool ignore_enxio
 	for (rpm_ctx = 0; rpm_ctx < QCOM_SMD_RPM_STATE_NUM; rpm_ctx++) {
 		bw_bps = icc_units_to_bps(bw[rpm_ctx]);
 
+		/*
+		 * Every icc_set_bw() on a path lands here for each node of it,
+		 * and the RPM gets the same value again (a peak-only voter such
+		 * as a CPU frequency floor changes nothing here). Each request
+		 * is an SMD round trip with an interrupt: skip the repeats.
+		 */
+		if ((qn->rpm_sent & BIT(rpm_ctx)) && qn->rpm_bw[rpm_ctx] == bw_bps)
+			continue;
+
 		if (qn->mas_rpm_id != -1) {
 			ret = qcom_icc_rpm_smd_send(rpm_ctx,
 						    RPM_BUS_MASTER_REQ,
@@ -240,6 +249,9 @@ static int qcom_icc_rpm_set(struct qcom_icc_node *qn, u64 *bw, bool ignore_enxio
 					return ret;
 			}
 		}
+
+		qn->rpm_bw[rpm_ctx] = bw_bps;
+		qn->rpm_sent |= BIT(rpm_ctx);
 	}
 
 	return 0;
@@ -570,6 +582,9 @@ regmap_done:
 
 		if (!qnodes[i]->ib_coeff)
 			qnodes[i]->ib_coeff = qp->ib_coeff;
+
+		/* the node descriptions are static: a re-probe sends again */
+		qnodes[i]->rpm_sent = 0;
 
 		node = icc_node_create(qnodes[i]->id);
 		if (IS_ERR(node)) {

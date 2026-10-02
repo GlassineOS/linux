@@ -123,6 +123,9 @@ struct qcom_icc_node {
 	u16 ab_coeff;
 	u16 ib_coeff;
 	u32 bus_clk_rate[QCOM_SMD_RPM_STATE_NUM];
+	/* the bandwidth last sent to the RPM per context (valid: rpm_sent bit) */
+	u64 rpm_bw[QCOM_SMD_RPM_STATE_NUM];
+	u8 rpm_sent;
 };
 
 struct qcom_icc_desc {
