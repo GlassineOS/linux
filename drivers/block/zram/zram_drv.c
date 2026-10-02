@@ -2376,12 +2376,12 @@ static bool highest_priority_algorithm(struct zram *zram, u32 prio)
 }
 
 static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
+				      unsigned long lo, unsigned long hi,
 				      struct zram_pp_ctl *ctl)
 {
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
 	unsigned long index;
 
-	for (index = 0; index < nr_pages; index++) {
+	for (index = lo; index < hi; index++) {
 		bool ok = true;
 
 		slot_lock(zram, index);
@@ -2531,22 +2531,41 @@ static ssize_t recompress_store(struct device *dev,
 				const char *buf, size_t len)
 {
 	struct zram *zram = dev_to_zram(dev);
-	char *args, *param, *val, *algo = NULL;
+	char *args, *param, *val, *algo = NULL, *idx_args = NULL;
 	u64 num_recomp_pages = ULLONG_MAX;
 	struct zram_pp_ctl *ctl = NULL;
 	s32 prio = ZRAM_SECONDARY_COMP;
 	u32 mode = 0, threshold = 0;
 	struct zram_pp_slot *pps;
 	struct page *page = NULL;
-	bool prio_param = false;
+	bool prio_param = false, idx_param = false;
 	ssize_t ret;
+
+	/*
+	 * page_index= / page_indexes= (as for writeback) limit the scan to
+	 * those slots: user space that knows which slots it wants (e.g. the
+	 * swap offsets of one process from /proc/PID/pagemap) recompresses
+	 * just those. They are scanned after the setup below, from a copy,
+	 * since next_arg() cuts up the buffer it walks.
+	 */
+	idx_args = kstrdup(buf, GFP_KERNEL);
+	if (!idx_args)
+		return -ENOMEM;
 
 	args = skip_spaces(buf);
 	while (*args) {
 		args = next_arg(args, &param, &val);
 
-		if (!val || !*val)
-			return -EINVAL;
+		if (!val || !*val) {
+			ret = -EINVAL;
+			goto out_args;
+		}
+
+		if (!strcmp(param, "page_index") ||
+		    !strcmp(param, "page_indexes")) {
+			idx_param = true;
+			continue;
+		}
 
 		if (!strcmp(param, "type")) {
 			if (!strcmp(val, "idle"))
@@ -2555,8 +2574,10 @@ static ssize_t recompress_store(struct device *dev,
 				mode = RECOMPRESS_HUGE;
 			if (!strcmp(val, "huge_idle"))
 				mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
-			if (!mode)
-				return -EINVAL;
+			if (!mode) {
+				ret = -EINVAL;
+				goto out_args;
+			}
 			continue;
 		}
 
@@ -2567,7 +2588,7 @@ static ssize_t recompress_store(struct device *dev,
 			 */
 			ret = kstrtoull(val, 10, &num_recomp_pages);
 			if (ret)
-				return ret;
+				goto out_args;
 			continue;
 		}
 
@@ -2578,7 +2599,7 @@ static ssize_t recompress_store(struct device *dev,
 			 */
 			ret = kstrtouint(val, 10, &threshold);
 			if (ret)
-				return ret;
+				goto out_args;
 			continue;
 		}
 
@@ -2591,37 +2612,42 @@ static ssize_t recompress_store(struct device *dev,
 			prio_param = true;
 			ret = kstrtoint(val, 10, &prio);
 			if (ret)
-				return ret;
+				goto out_args;
 			continue;
 		}
 	}
 
-	if (threshold >= huge_class_size)
-		return -EINVAL;
+	if (threshold >= huge_class_size) {
+		ret = -EINVAL;
+		goto out_args;
+	}
 
-	guard(rwsem_write)(&zram->dev_lock);
+	down_write(&zram->dev_lock);
+	ret = -EINVAL;
 	if (!init_done(zram))
-		return -EINVAL;
+		goto out_unlock;
 
 	if (prio_param) {
 		if (prio < ZRAM_SECONDARY_COMP || prio >= ZRAM_MAX_COMPS)
-			return -EINVAL;
+			goto out_unlock;
 	}
 
 	if (algo && prio_param) {
 		ret = validate_algo_priority(zram, algo, prio);
 		if (ret)
-			return ret;
+			goto out_unlock;
 	}
 
 	if (algo && !prio_param) {
+		ret = -EINVAL;
 		prio = lookup_algo_priority(zram, algo, ZRAM_SECONDARY_COMP);
 		if (prio < 0)
-			return -EINVAL;
+			goto out_unlock;
 	}
 
+	ret = -EINVAL;
 	if (!zram->comps[prio])
-		return -EINVAL;
+		goto out_unlock;
 
 	page = alloc_page(GFP_KERNEL);
 	if (!page) {
@@ -2635,7 +2661,30 @@ static ssize_t recompress_store(struct device *dev,
 		goto out;
 	}
 
-	scan_slots_for_recompress(zram, mode, prio, ctl);
+	if (idx_param) {
+		unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+		unsigned long lo, hi;
+		int err;
+
+		args = skip_spaces(idx_args);
+		while (*args) {
+			args = next_arg(args, &param, &val);
+			if (!strcmp(param, "page_index"))
+				err = parse_page_index(val, nr_pages, &lo, &hi);
+			else if (!strcmp(param, "page_indexes"))
+				err = parse_page_indexes(val, nr_pages, &lo, &hi);
+			else
+				continue;
+			if (err) {
+				ret = err;
+				goto out;
+			}
+			scan_slots_for_recompress(zram, mode, prio, lo, hi, ctl);
+		}
+	} else {
+		scan_slots_for_recompress(zram, mode, prio, 0,
+					  zram->disksize >> PAGE_SHIFT, ctl);
+	}
 
 	ret = len;
 	while ((pps = select_pp_slot(ctl))) {
@@ -2666,6 +2715,10 @@ out:
 	if (page)
 		__free_page(page);
 	release_pp_ctl(zram, ctl);
+out_unlock:
+	up_write(&zram->dev_lock);
+out_args:
+	kfree(idx_args);
 	return ret;
 }
 #endif
