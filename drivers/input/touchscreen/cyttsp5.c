@@ -208,6 +208,11 @@ struct cyttsp5 {
 	struct regmap *regmap;
 	struct touchscreen_properties prop;
 	struct regulator_bulk_data supplies[2];
+	/* NA1: the pip debug file (patch 0044) */
+	struct mutex pip_lock;
+	int pip_rc;
+	u16 pip_len;
+	u8 pip_resp[128];
 };
 
 /*
@@ -901,6 +906,7 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 	dev_set_drvdata(dev, ts);
 
 	init_completion(&ts->cmd_done);
+	mutex_init(&ts->pip_lock);
 
 	/* Power up the device */
 	ts->supplies[0].supply = "vdd";
@@ -1023,8 +1029,11 @@ static int __maybe_unused cyttsp5_suspend(struct device *dev)
 	ts->num_prv_rec = 0;
 	enable_irq(ts->irq);
 
-	if (!device_may_wakeup(dev))
+	if (!device_may_wakeup(dev)) {
+		mutex_lock(&ts->pip_lock);
 		cyttsp5_power_control(ts, false);
+		mutex_unlock(&ts->pip_lock);
+	}
 
 	return 0;
 }
@@ -1033,19 +1042,144 @@ static int __maybe_unused cyttsp5_resume(struct device *dev)
 {
 	struct cyttsp5 *ts = dev_get_drvdata(dev);
 
-	if (!device_may_wakeup(dev))
+	if (!device_may_wakeup(dev)) {
+		mutex_lock(&ts->pip_lock);
 		cyttsp5_power_control(ts, true);
+		mutex_unlock(&ts->pip_lock);
+	}
 
 	return 0;
 }
 
 static SIMPLE_DEV_PM_OPS(cyttsp5_pm, cyttsp5_suspend, cyttsp5_resume);
 
+/*
+ * NA1: a raw PIP command file for tuning the controller (2026-10-03, the
+ * scroll-start study: reports missing for up to ~100 ms after touch-down).
+ *   echo "05 4d" > /sys/bus/i2c/devices/<dev>/pip    (opcode, then parameters)
+ *   cat /sys/bus/i2c/devices/<dev>/pip               -> "rc 0: <response frame>"
+ * Root only. Only commands that leave the flash alone: NULL (0x00), GET_SYSINFO
+ * (0x02), GET_PARAM (0x05) and SET_PARAM (0x06, RAM only: a controller reset
+ * restores the flash config). Bootloader and config-block commands are refused.
+ */
+#define PIP_CMD_NULL				0x00
+#define PIP_CMD_GET_PARAM			0x05
+#define PIP_CMD_SET_PARAM			0x06
+#define CY_PIP_TIMEOUT_MS			500
+
+static ssize_t pip_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct cyttsp5 *ts = dev_get_drvdata(dev);
+	u8 cmd[HID_OUTPUT_MAX_CMD_SIZE - 1];
+	char *copy, *rest, *tok;
+	size_t n = 4;
+	long left;
+	int rc = 0;
+
+	copy = kstrndup(buf, count, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	rest = copy;
+	while ((tok = strsep(&rest, " \t\n"))) {
+		if (!*tok)
+			continue;
+		if (n >= sizeof(cmd)) {
+			rc = -E2BIG;
+			break;
+		}
+		rc = kstrtou8(tok, 16, &cmd[n]);
+		if (rc)
+			break;
+		n++;
+	}
+	kfree(copy);
+	if (rc)
+		return rc;
+	if (n == 4)
+		return -EINVAL;
+
+	switch (cmd[4]) {
+	case PIP_CMD_NULL:
+	case HID_OUTPUT_GET_SYSINFO:
+	case PIP_CMD_GET_PARAM:
+	case PIP_CMD_SET_PARAM:
+		break;
+	default:
+		return -EPERM;
+	}
+
+	put_unaligned_le16(n, cmd);
+	cmd[2] = HID_APP_OUTPUT_REPORT_ID;
+	cmd[3] = 0x0; /* Reserved */
+
+	mutex_lock(&ts->pip_lock);
+	reinit_completion(&ts->cmd_done);
+	memset(ts->response_buf, 0, 8);
+	rc = cyttsp5_write(ts, HID_OUTPUT_REG, cmd, n);
+	left = msecs_to_jiffies(CY_PIP_TIMEOUT_MS);
+	while (!rc) {
+		left = wait_for_completion_interruptible_timeout(&ts->cmd_done,
+								 left);
+		if (left <= 0) {
+			rc = left ? left : -ETIMEDOUT;
+			break;
+		}
+		/*
+		 * A late reply to an earlier command (seen 10-03: a SET_PARAM's
+		 * answer came after its wait and failed the next GET_PARAM) or
+		 * an empty frame: not ours, wait on for our own.
+		 */
+		if (get_unaligned_le16(ts->response_buf) <=
+		    HID_OUTPUT_RESPONSE_CMD_OFFSET ||
+		    (ts->response_buf[HID_OUTPUT_RESPONSE_REPORT_OFFSET] ==
+		     HID_APP_RESPONSE_REPORT_ID &&
+		     (ts->response_buf[HID_OUTPUT_RESPONSE_CMD_OFFSET] &
+		      HID_OUTPUT_RESPONSE_CMD_MASK) != cmd[4])) {
+			reinit_completion(&ts->cmd_done);
+			continue;
+		}
+		rc = cyttsp5_validate_cmd_response(ts, cmd[4]);
+		break;
+	}
+	ts->pip_rc = rc;
+	ts->pip_len = rc ? 0 : min_t(u16, get_unaligned_le16(ts->response_buf),
+				     sizeof(ts->pip_resp));
+	memcpy(ts->pip_resp, ts->response_buf, ts->pip_len);
+	mutex_unlock(&ts->pip_lock);
+
+	return rc ? rc : count;
+}
+
+static ssize_t pip_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct cyttsp5 *ts = dev_get_drvdata(dev);
+	int i, len;
+
+	mutex_lock(&ts->pip_lock);
+	len = sysfs_emit(buf, "rc %d:", ts->pip_rc);
+	for (i = 0; i < ts->pip_len; i++)
+		len += sysfs_emit_at(buf, len, " %02x", ts->pip_resp[i]);
+	len += sysfs_emit_at(buf, len, "\n");
+	mutex_unlock(&ts->pip_lock);
+
+	return len;
+}
+static DEVICE_ATTR_ADMIN_RW(pip);
+
+static struct attribute *cyttsp5_attrs[] = {
+	&dev_attr_pip.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(cyttsp5);
+
 static struct i2c_driver cyttsp5_i2c_driver = {
 	.driver = {
 		.name = CYTTSP5_NAME,
 		.of_match_table = cyttsp5_of_match,
 		.pm = &cyttsp5_pm,
+		.dev_groups = cyttsp5_groups,
 	},
 	.probe = cyttsp5_i2c_probe,
 	.id_table = cyttsp5_i2c_id,
