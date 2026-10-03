@@ -27,6 +27,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/reboot.h>
 #include <linux/reset-controller.h>
 #include <linux/remoteproc.h>
 #include <linux/sizes.h>
@@ -548,6 +549,47 @@ static int qcom_scm_io_rmw(phys_addr_t addr, unsigned int mask, unsigned int val
 
 	return qcom_scm_io_writel(addr, new);
 }
+
+/*
+ * NA1 (patch 0045): "reboot edl" -> emergency download (EDL, 05c6:9008) without
+ * Android or ABL. As the stock msm-4.4 kernel's enable_emergency_dload_mode(): the
+ * boot service's set-download-mode call with mode 0x01 (EDLOAD; the crash dump
+ * is 0x10), then the normal PSCI reset; the boot ROM sees the mode and stays in
+ * 9008. A restart handler, not a reboot notifier: qcom_scm_shutdown() turns the
+ * download mode off during device_shutdown(), which runs after the notifiers but
+ * before the restart handlers. Runs ahead of PSCI's (priority 129). A cold boot
+ * (long press) clears the mode.
+ */
+#define QCOM_SCM_EDLOAD_MODE	0x01
+
+static int qcom_scm_edl_restart(struct notifier_block *nb, unsigned long action,
+				void *data)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_BOOT,
+		.cmd = QCOM_SCM_BOOT_SET_DLOAD_MODE,
+		.arginfo = QCOM_SCM_ARGS(2),
+		.args[0] = QCOM_SCM_EDLOAD_MODE,
+		.args[1] = 0,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+	const char *cmd = data;
+	int ret;
+
+	if (!cmd || strcmp(cmd, "edl") || !__scm)
+		return NOTIFY_DONE;
+
+	ret = qcom_scm_call_atomic(__scm->dev, &desc, NULL);
+	pr_emerg("qcom_scm: reboot edl: emergency download mode %s (%d)\n",
+		 ret ? "FAILED" : "set", ret);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block qcom_scm_edl_nb = {
+	.notifier_call = qcom_scm_edl_restart,
+	.priority = 192,
+};
 
 static void qcom_scm_set_download_mode(struct qcom_scm *scm, u32 dload_mode)
 {
@@ -2915,6 +2957,11 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	 * disabled below by a clean shutdown/reboot.
 	 */
 	qcom_scm_set_download_mode(scm, download_mode);
+
+	/* NA1: "reboot edl" (patch 0045) */
+	if (__qcom_scm_is_call_available(scm->dev, QCOM_SCM_SVC_BOOT,
+					 QCOM_SCM_BOOT_SET_DLOAD_MODE))
+		register_restart_handler(&qcom_scm_edl_nb);
 
 	/*
 	 * Disable SDI if indicated by DT that it is enabled by default.
