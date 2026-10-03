@@ -850,6 +850,18 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 	of_platform_depopulate(&pdev->dev);
 	platform_device_put(qcom->dwc3);
 
+	/*
+	 * NA1 (patch 0046): stop runtime PM BEFORE the clocks go off and the
+	 * BCR is asserted. pm_runtime_allow() at the end queued an async
+	 * runtime suspend; when its worker won the race against
+	 * pm_runtime_disable(), dwc3_qcom_suspend() read qscratch on the
+	 * unclocked, reset block and stalled the bus (silent SoC hang, 900E,
+	 * 2026-10-03). Disable first (cancels or waits for the callback), then
+	 * allow (drops probe's forbid; no callback while disabled).
+	 */
+	pm_runtime_disable(dev);
+	pm_runtime_allow(dev);
+
 	for (i = qcom->num_clocks - 1; i >= 0; i--) {
 		clk_disable_unprepare(qcom->clks[i]);
 		clk_put(qcom->clks[i]);
@@ -858,9 +870,6 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 
 	dwc3_qcom_interconnect_exit(qcom);
 	reset_control_assert(qcom->resets);
-
-	pm_runtime_allow(dev);
-	pm_runtime_disable(dev);
 }
 
 static int __maybe_unused dwc3_qcom_pm_suspend(struct device *dev)
