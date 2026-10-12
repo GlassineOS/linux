@@ -234,9 +234,9 @@ static int qcom_smgr_request_buffering(struct qcom_smgr *smgr,
 		 * A report cannot have 0 samples, therefore report rate cannot
 		 * be higher than sample rate.
 		 *
-		 * Fow now we default to the maximum sample rate and set the
-		 * report rate such that every report contains only 1 sample.
-		 * This gives us the lowest latency.
+		 * The sample rate is the one set through sampling_frequency
+		 * (the maximum until then, clamped to it) and the report rate
+		 * matches it: every report contains only 1 sample.
 		 */
 		if (sensor->data_types[0].native_sample_rates)
 			sample_rate = sensor->data_types[0].native_sample_rates
@@ -250,6 +250,9 @@ static int qcom_smgr_request_buffering(struct qcom_smgr *smgr,
 		if (sample_rate == 0 ||
 		    sample_rate > sensor->data_types[0].max_sample_rate)
 			sample_rate = sensor->data_types[0].max_sample_rate;
+		if (sensor->data_types[0].cur_sample_rate &&
+		    sensor->data_types[0].cur_sample_rate < sample_rate)
+			sample_rate = sensor->data_types[0].cur_sample_rate;
 
 		req.report_rate = sample_rate * SMGR_REPORT_RATE_HZ;
 
@@ -298,8 +301,9 @@ static int qcom_smgr_request_buffering(struct qcom_smgr *smgr,
 		return -EREMOTEIO;
 	}
 
-	/* Keep track of requested sample rate */
-	sensor->data_types[0].cur_sample_rate = sample_rate;
+	/* Keep track of the sample rate in use (kept across a disable) */
+	if (enable)
+		sensor->data_types[0].cur_sample_rate = sample_rate;
 
 	return 0;
 }
@@ -433,7 +437,10 @@ static int qcom_smgr_iio_write_raw(struct iio_dev *iio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		priv->sensor->data_types[0].cur_sample_rate = val;
+		if (val < 1)
+			return -EINVAL;
+		/* clamped to the maximum at the next buffering request */
+		priv->sensor->data_types[0].cur_sample_rate = min_t(int, val, U16_MAX);
 
 		/*
 		 * Send new SMGR buffering request with updated rates
