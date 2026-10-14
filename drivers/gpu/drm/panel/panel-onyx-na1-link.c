@@ -238,6 +238,7 @@ struct na1_link {
 	struct delayed_work hv_timeout;
 	unsigned long rails_since;	/* jiffies at rails-up, for hv_cap_ms */
 	bool bridge_up, rails_up;
+	bool enabled;			/* between panel enable and disable (under lock) */
 };
 
 static void na1_link_fill_mode(struct drm_display_mode *m)
@@ -532,6 +533,67 @@ static const struct kernel_param_ops na1_hv_kick_ops = {
 module_param_cb(hv_kick, &na1_hv_kick_ops, NULL, 0200);
 MODULE_PARM_DESC(hv_kick, "write: restart the hv_max_ms count if the rails are up");
 
+static int na1_link_check(struct na1_link *ctx);
+
+/*
+ * Rails alone, with the link kept up ("warm idle", 2026-10-14): the frame
+ * source drops the rails while the DRM pipe and the bridge stay up (no frames
+ * on the wire), and raises them again without a modeset (skips the ~45 ms of
+ * bridge power-up + init table, and the DSI host power-on). Same sequences and
+ * guards as enable/disable: rails up only with hv=1, only between panel enable
+ * and disable, only with the DSI link clocks running at the mode's rate,
+ * after the read-only PMIC pre-flight check, and always with the hv_max_ms
+ * timer armed (na1_rails_up). MD0 stays as enable left it (1): the bridge's
+ * outputs hold the last (neutral) frame, as during an idle gap with the rails
+ * up. Writing 0 is always allowed. Reads as hv_on. No new PMIC write path:
+ * the same na1_rails_up/na1_rails_down (ENABLE 0x09 bits 0/1 only).
+ * Uses the one-instance na1_ctx of the hv_kick param (0050).
+ */
+
+static int na1_rails_set(const char *val, const struct kernel_param *kp)
+{
+	struct na1_link *ctx;
+	bool on;
+	int ret;
+
+	ret = kstrtobool(val, &on);
+	if (ret)
+		return ret;
+	mutex_lock(&na1_ctx_lock);
+	ctx = na1_ctx;
+	if (!ctx) {
+		ret = -ENODEV;
+	} else if (!on) {
+		cancel_delayed_work_sync(&ctx->hv_timeout);
+		mutex_lock(&ctx->lock);
+		na1_rails_down(ctx);
+		mutex_unlock(&ctx->lock);
+	} else {
+		mutex_lock(&ctx->lock);
+		if (ctx->rails_up)
+			ret = 0;		/* the timer armed at its rails-up still runs */
+		else if (!hv)
+			ret = -EPERM;
+		else if (!ctx->enabled || !ctx->bridge_up)
+			ret = -ENOTCONN;
+		else {
+			ret = na1_link_check(ctx);
+			if (!ret)
+				ret = na1_rails_up(ctx);
+		}
+		mutex_unlock(&ctx->lock);
+	}
+	mutex_unlock(&na1_ctx_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops na1_rails_ops = {
+	.set = na1_rails_set,
+	.get = param_get_bool,
+};
+module_param_cb(rails, &na1_rails_ops, &hv_on, 0644);
+MODULE_PARM_DESC(rails, "MAX17135 rails while the link stays up: write 1 = up (hv=1, panel enabled, link checked, hv_max_ms armed), 0 = down; reads hv_on");
+
 static int na1_link_get_modes(struct drm_panel *panel, struct drm_connector *connector)
 {
 	struct drm_display_mode m;
@@ -683,6 +745,7 @@ static int na1_link_enable(struct drm_panel *panel)
 			 ret ? "FAILED" : "ok", ret);
 		ret = 0;
 	}
+	ctx->enabled = true;
 	mutex_unlock(&ctx->lock);
 	return ret;
 }
@@ -693,6 +756,7 @@ static int na1_link_disable(struct drm_panel *panel)
 
 	cancel_delayed_work_sync(&ctx->hv_timeout);
 	mutex_lock(&ctx->lock);
+	ctx->enabled = false;
 	na1_rails_down(ctx);
 	mutex_unlock(&ctx->lock);
 	gpiod_set_value_cansleep(ctx->mode0, 0);	/* stock frame_done: output_enable(0) */
@@ -839,11 +903,11 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 		drm_panel_remove(&ctx->panel);
 		return ret;
 	}
-	dev_info(dev, "NA1 e-ink link: 285x1423 RGB888, DSI cmd mode, 2 lanes; bridge %s, pmic %s\n",
-		 dev_name(&ctx->tc->dev), dev_name(&ctx->pmic->dev));
 	mutex_lock(&na1_ctx_lock);
 	na1_ctx = ctx;
 	mutex_unlock(&na1_ctx_lock);
+	dev_info(dev, "NA1 e-ink link: 285x1423 RGB888, DSI cmd mode, 2 lanes; bridge %s, pmic %s\n",
+		 dev_name(&ctx->tc->dev), dev_name(&ctx->pmic->dev));
 	return 0;
 }
 
@@ -856,6 +920,7 @@ static void na1_link_remove(struct mipi_dsi_device *dsi)
 	mutex_unlock(&na1_ctx_lock);
 	cancel_delayed_work_sync(&ctx->hv_timeout);
 	mutex_lock(&ctx->lock);
+	ctx->enabled = false;
 	na1_rails_down(ctx);
 	mutex_unlock(&ctx->lock);
 	na1_bridge_down(ctx);
@@ -868,8 +933,12 @@ static void na1_link_shutdown(struct mipi_dsi_device *dsi)
 {
 	struct na1_link *ctx = mipi_dsi_get_drvdata(dsi);
 
+	mutex_lock(&na1_ctx_lock);
+	na1_ctx = NULL;
+	mutex_unlock(&na1_ctx_lock);
 	cancel_delayed_work_sync(&ctx->hv_timeout);
 	mutex_lock(&ctx->lock);
+	ctx->enabled = false;
 	na1_rails_down(ctx);
 	mutex_unlock(&ctx->lock);
 }
