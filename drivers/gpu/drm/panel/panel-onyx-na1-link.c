@@ -25,7 +25,8 @@
  *    stock max17135_setup_timings() would reprogram NVM on a mismatch, we
  *    refuse instead.
  *  - the rails come up only with the module parameter hv=1 (default 0) and
- *    are forced off after hv_max_ms (backstop for a crashed frame source).
+ *    are forced off after hv_max_ms (backstop for a crashed frame source);
+ *    a write to hv_kick restarts that count while they are up.
  * The wakeup / vcom_ctrl pins stay low (gpio-hogs): stock (max17135_pass_num
  * = 2, control_mode 0) never drives them either; the rails are register-
  * switched, so the hogs are NOT a protection by themselves.
@@ -112,6 +113,26 @@ MODULE_PARM_DESC(temperature, "MAX17135 reg 0x00 (deg C) at the last rails-up; -
 static bool hv_on;
 module_param(hv_on, bool, 0444);
 MODULE_PARM_DESC(hv_on, "rails currently up");
+/*
+ * hv_kick (2026-10-14, pen latency): hv_max_ms counted from rails-up, so the
+ * frame source had to cycle the link (~100 ms without frames) every < 30 s of
+ * continuous driving. A write to hv_kick while the rails are up restarts the
+ * count instead: the backstop becomes "hv_max_ms since the last kick" and
+ * still fires when the frame source dies. It only re-arms the timer, it never
+ * touches the PMIC. One instance (the NA1 has one panel): na1_ctx.
+ * Hard cap: this panel never sees the frames (they go DPU -> DSI host), so it
+ * cannot tell a kick after a real flip from one by a wedged frame source that
+ * still kicks; kicks never extend a rails-up past hv_cap_ms, then the timer
+ * fires regardless (epdd cycles the link once before that).
+ */
+static struct na1_link *na1_ctx;
+static DEFINE_MUTEX(na1_ctx_lock);	/* na1_ctx vs probe/remove */
+static unsigned int hv_cap_ms = 600000;
+module_param(hv_cap_ms, uint, 0644);
+MODULE_PARM_DESC(hv_cap_ms, "kicks never keep the rails up longer than this (ms, 1000..3600000)");
+static unsigned int hv_kicks;
+module_param(hv_kicks, uint, 0444);
+MODULE_PARM_DESC(hv_kicks, "hv_kick writes that re-armed the rails timeout");
 /*
  * VDDMX vote while the link is up (2026-10-02, the power-key display stall):
  * four times the DSI PLL died under a running link after the device had sat
@@ -215,6 +236,7 @@ struct na1_link {
 	struct device *mx;		/* virtual device of the VDDMX domain (optional) */
 	struct mutex lock;		/* rails */
 	struct delayed_work hv_timeout;
+	unsigned long rails_since;	/* jiffies at rails-up, for hv_cap_ms */
 	bool bridge_up, rails_up;
 };
 
@@ -453,8 +475,10 @@ static int na1_rails_up(struct na1_link *ctx)
 	v = max_read(ctx, MAX_TEMP);
 	temperature = v < 0 || v == 0x7f ? -128 : (s8)v;	/* 0x7f: no valid thermistor reading */
 	hv_on = true;
-	schedule_delayed_work(&ctx->hv_timeout,
-			      msecs_to_jiffies(clamp(hv_max_ms, 100u, 30000u)));
+	ctx->rails_since = jiffies;
+	/* mod_: a kick racing a disable may have left the timer armed */
+	mod_delayed_work(system_percpu_wq, &ctx->hv_timeout,
+			 msecs_to_jiffies(clamp(hv_max_ms, 100u, 30000u)));
 	if (temperature == -128)
 		dev_info(ctx->dev, "MAX17135 rails up (power good after %d ms)\n", i);
 	else
@@ -471,11 +495,42 @@ static void na1_hv_timeout(struct work_struct *work)
 
 	mutex_lock(&ctx->lock);
 	if (ctx->rails_up) {
-		dev_warn(ctx->dev, "HV on longer than %u ms: forcing rails off\n", hv_max_ms);
+		dev_warn(ctx->dev, "HV on longer than %u ms since rails-up/kick (or hv_cap_ms %u): forcing rails off\n",
+			 hv_max_ms, hv_cap_ms);
 		na1_rails_down(ctx);
 	}
 	mutex_unlock(&ctx->lock);
 }
+
+static int na1_hv_kick_set(const char *val, const struct kernel_param *kp)
+{
+	struct na1_link *ctx;
+	unsigned long cap, up;
+	int ret = -ENODEV;
+
+	mutex_lock(&na1_ctx_lock);
+	ctx = na1_ctx;
+	if (ctx) {
+		mutex_lock(&ctx->lock);
+		ret = 0;
+		cap = msecs_to_jiffies(clamp(hv_cap_ms, 1000u, 3600000u));
+		up = jiffies - ctx->rails_since;
+		if (ctx->rails_up && up < cap) {
+			mod_delayed_work(system_percpu_wq, &ctx->hv_timeout,
+					 min(msecs_to_jiffies(clamp(hv_max_ms, 100u, 30000u)), cap - up));
+			hv_kicks++;
+		}
+		mutex_unlock(&ctx->lock);
+	}
+	mutex_unlock(&na1_ctx_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops na1_hv_kick_ops = {
+	.set = na1_hv_kick_set,
+};
+module_param_cb(hv_kick, &na1_hv_kick_ops, NULL, 0200);
+MODULE_PARM_DESC(hv_kick, "write: restart the hv_max_ms count if the rails are up");
 
 static int na1_link_get_modes(struct drm_panel *panel, struct drm_connector *connector)
 {
@@ -786,6 +841,9 @@ static int na1_link_probe(struct mipi_dsi_device *dsi)
 	}
 	dev_info(dev, "NA1 e-ink link: 285x1423 RGB888, DSI cmd mode, 2 lanes; bridge %s, pmic %s\n",
 		 dev_name(&ctx->tc->dev), dev_name(&ctx->pmic->dev));
+	mutex_lock(&na1_ctx_lock);
+	na1_ctx = ctx;
+	mutex_unlock(&na1_ctx_lock);
 	return 0;
 }
 
@@ -793,6 +851,9 @@ static void na1_link_remove(struct mipi_dsi_device *dsi)
 {
 	struct na1_link *ctx = mipi_dsi_get_drvdata(dsi);
 
+	mutex_lock(&na1_ctx_lock);
+	na1_ctx = NULL;		/* no kick re-arms the timer from here on */
+	mutex_unlock(&na1_ctx_lock);
 	cancel_delayed_work_sync(&ctx->hv_timeout);
 	mutex_lock(&ctx->lock);
 	na1_rails_down(ctx);
