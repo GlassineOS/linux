@@ -31,6 +31,35 @@
 #define CY_NUM_BTN_EVENT_ID			GENMASK(CY_BITS_PER_BTN - 1, 0)
 
 #define MAX_AREA				255
+
+/*
+ * NA1 palm rejection (all off by default; runtime-writable in
+ * /sys/module/cyttsp5/parameters, set at boot by na1-touch-palm). The PIP
+ * report carries more than the axes this driver reads: the header's
+ * large-object flag (byte 5 bit 7, next to the record count) and each
+ * record's touch type (byte 0 bits 2:0: 0 finger, 1 hover, 2 stylus, 3
+ * glove). Contacts marked palm are reported as MT_TOOL_PALM, which
+ * libinput turns into a touch cancel and ignores until the lift.
+ *   palm_major  ABS_MT_TOUCH_MAJOR (as reported, after the scaling
+ *               below) at or above which a contact is a palm; 0 = off
+ *   palm_lo     1: every contact is a palm while the large-object flag
+ *               is set
+ *   palm_hover  1: records whose touch type is hover are not contacts
+ *   palm_debug  1: log the raw header/record fields (rate-limited), to
+ *               measure palms and confirm the bit positions above
+ */
+static unsigned int palm_major;
+module_param(palm_major, uint, 0644);
+static bool palm_lo;
+module_param(palm_lo, bool, 0644);
+static bool palm_hover;
+module_param(palm_hover, bool, 0644);
+static bool palm_debug;
+module_param(palm_debug, bool, 0644);
+#define CY_HDR_LO_BYTE				5	/* input_buf: len(2) id(1) time(2) */
+#define CY_HDR_LO_BIT				BIT(7)
+#define CY_REC_TYPE_MASK			0x07	/* record byte 0 */
+#define CY_OBJ_HOVER				1
 #define HID_OUTPUT_BL_SOP			0x1
 #define HID_OUTPUT_BL_EOP			0x17
 #define HID_OUTPUT_BL_LAUNCH_APP		0x3B
@@ -300,7 +329,9 @@ static void cyttsp5_get_mt_touches(struct cyttsp5 *ts,
 	int i, t = 0, offset = 0;
 	DECLARE_BITMAP(ids, MAX_CY_TCH_T_IDS);
 	u8 *tch_addr;
-	int tmp;
+	int tmp, raw_maj, type, tool;
+	bool lo = ts->input_buf[2] == HID_TOUCH_REPORT_ID &&
+		  (ts->input_buf[CY_HDR_LO_BYTE] & CY_HDR_LO_BIT);
 
 	bitmap_zero(ids, MAX_CY_TCH_T_IDS);
 	memset(tch->abs, 0, sizeof(tch->abs));
@@ -317,16 +348,31 @@ static void cyttsp5_get_mt_touches(struct cyttsp5 *ts,
 	for (i = 0; i < num_cur_tch; i++) {
 		tch_addr = ts->input_buf + offset + (i * TOUCH_REPORT_SIZE);
 		cyttsp5_get_touch_record(ts, tch, tch_addr);
+		raw_maj = tch->abs[CY_TCH_MAJ];
+		type = tch_addr[0] & CY_REC_TYPE_MASK;
+		if (palm_hover && type == CY_OBJ_HOVER)
+			continue;	/* not down: INPUT_MT_DROP_UNUSED lifts it */
 
 		/* Convert MAJOR/MINOR from mm to resolution */
 		tmp = tch->abs[CY_TCH_MAJ] * 100 * si->sensing_conf_data.res_x;
 		tch->abs[CY_TCH_MAJ] = tmp / si->sensing_conf_data.len_x;
 		tmp = tch->abs[CY_TCH_MIN] * 100 * si->sensing_conf_data.res_x;
 		tch->abs[CY_TCH_MIN] = tmp / si->sensing_conf_data.len_x;
+		if (palm_debug)
+			dev_info_ratelimited(ts->dev,
+				"palm_debug: hdr %02x %02x rec %02x %02x id %d raw maj %d -> maj %d min %d p %d\n",
+				ts->input_buf[5], ts->input_buf[6], tch_addr[0],
+				tch_addr[1], tch->abs[CY_TCH_T], raw_maj,
+				tch->abs[CY_TCH_MAJ], tch->abs[CY_TCH_MIN],
+				tch->abs[CY_TCH_P]);
+
+		tool = (palm_lo && lo) ||
+		       (palm_major && tch->abs[CY_TCH_MAJ] >= palm_major) ?
+		       MT_TOOL_PALM : MT_TOOL_FINGER;
 
 		t = tch->abs[CY_TCH_T];
 		input_mt_slot(ts->input, t);
-		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
+		input_mt_report_slot_state(ts->input, tool, true);
 		__set_bit(t, ids);
 
 		/* position and pressure fields */
@@ -397,6 +443,8 @@ static int cyttsp5_setup_input_device(struct device *dev)
 
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, MAX_AREA, 0, 0);
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MINOR, 0, MAX_AREA, 0, 0);
+	/* NA1: MT_TOOL_PALM for palm rejection (see palm_major) */
+	input_set_abs_params(ts->input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX, 0, 0);
 
 	/*
 	 * NA1: parse touchscreen-inverted-* only now. Parsed before the axes
