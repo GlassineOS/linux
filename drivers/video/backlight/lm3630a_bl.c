@@ -595,6 +595,72 @@ static void lm3630a_remove(struct i2c_client *client)
 	}
 }
 
+/*
+ * NA1: each bank's full-scale current (REG_I_A/REG_I_B, 0..31 = 5 mA + n *
+ * 0.75 mA), set once to the maximum by chip_init. The stock Onyx driver sets
+ * it per colour temperature (warmth mixes by current, the brightness codes
+ * stay mid-range); at full scale a dim bank runs at tiny exponential codes and
+ * the light flickers with panel/GPU load. na1-powerd sets both with each
+ * light change: /sys/bus/i2c/devices/<dev>/current_a and current_b.
+ */
+static ssize_t lm3630a_current_show(struct device *dev, unsigned int reg, char *buf)
+{
+	struct lm3630a_chip *pchip = dev_get_drvdata(dev);
+	int rval = lm3630a_read(pchip, reg);
+
+	if (rval < 0)
+		return rval;
+	return sysfs_emit(buf, "%d\n", rval & 0x1F);
+}
+
+static ssize_t lm3630a_current_store(struct device *dev, unsigned int reg,
+				     const char *buf, size_t count)
+{
+	struct lm3630a_chip *pchip = dev_get_drvdata(dev);
+	unsigned int v;
+	int rval;
+
+	rval = kstrtouint(buf, 0, &v);
+	if (rval)
+		return rval;
+	if (v > 0x1F)
+		return -EINVAL;
+	rval = lm3630a_update(pchip, reg, 0x1F, v);
+	return rval < 0 ? rval : count;
+}
+
+static ssize_t current_a_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return lm3630a_current_show(dev, REG_I_A, buf);
+}
+
+static ssize_t current_a_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	return lm3630a_current_store(dev, REG_I_A, buf, count);
+}
+
+static ssize_t current_b_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return lm3630a_current_show(dev, REG_I_B, buf);
+}
+
+static ssize_t current_b_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	return lm3630a_current_store(dev, REG_I_B, buf, count);
+}
+
+static DEVICE_ATTR_RW(current_a);
+static DEVICE_ATTR_RW(current_b);
+
+static struct attribute *lm3630a_attrs[] = {
+	&dev_attr_current_a.attr,
+	&dev_attr_current_b.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(lm3630a);
+
 static const struct i2c_device_id lm3630a_id[] = {
 	{ .name = LM3630A_NAME },
 	{ }
@@ -613,6 +679,7 @@ static struct i2c_driver lm3630a_i2c_driver = {
 	.driver = {
 		   .name = LM3630A_NAME,
 		   .of_match_table = lm3630a_match_table,
+		   .dev_groups = lm3630a_groups,
 		   },
 	.probe = lm3630a_probe,
 	.remove = lm3630a_remove,
