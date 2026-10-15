@@ -1,0 +1,19 @@
+GlassineOS kernel
+=================
+
+This branch is the kernel of GlassineOS (https://github.com/GlassineOS):
+the sdm660-mainline kernel (https://github.com/sdm660-mainline/linux, base
+d52542d28026) plus the patches, device trees and config fragments the
+GlassineOS images build.
+
+Branches:
+  glassine/sdm660-7.2        what the images build
+  glassine/sdm660-7.2-debug  the same plus debug traces (not for daily use)
+
+Build (arm64 cross compiler; GlassineOS uses ghcr.io/glassineos/kernel-build):
+
+  make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out sdm660_defconfig onyx-noteair.config
+  make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out Image.gz qcom/sdm636-onyx-noteair.dtb modules
+
+Commits made with AI assistance carry an Assisted-by: trailer. They are not
+submitted upstream; see the GlassineOS contribution policy.
