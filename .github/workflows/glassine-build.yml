@@ -1,0 +1,68 @@
+# Build check for the GlassineOS branches: the Onyx Boox Note Air config
+# (sdm660_defconfig + onyx-noteair.config) compiles, with its device tree and
+# modules. Steps follow upstream's build-images.yml, on a GitHub-hosted arm64
+# runner (native build, no cross compiler). Not a release: what ships is
+# decided by the GlassineOS packages.
+name: GlassineOS build check
+
+on:
+  push:
+    branches:
+      - 'glassine/**'
+  pull_request:
+    branches:
+      - 'glassine/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod python3 zstd
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Configure (sdm660_defconfig + onyx-noteair.config)
+        run: |
+          make O=.output sdm660_defconfig onyx-noteair.config
+          # every fragment option must have survived (a missing dependency drops it silently)
+          missing=0
+          while read -r l; do
+            grep -qxF "$l" .output/.config || { echo "::error::fragment option not applied: $l"; missing=1; }
+          done < <(grep -hE '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' arch/arm64/configs/onyx-noteair.config)
+          exit $missing
+
+      - name: Build Image.gz, the device tree and modules
+        run: make O=.output -j"$(nproc)" Image.gz qcom/sdm636-onyx-noteair.dtb modules
+
+      - name: Install modules into a staging prefix
+        run: |
+          make O=.output INSTALL_MOD_PATH="$PWD/.output/modroot" INSTALL_MOD_STRIP=1 modules_install
+          tar -C .output/modroot -czf .output/modules.tar.gz lib/modules
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: noteair-kernel-${{ github.sha }}
+          retention-days: 14
+          path: |
+            .output/arch/arm64/boot/Image.gz
+            .output/arch/arm64/boot/dts/qcom/sdm636-onyx-noteair.dtb
+            .output/modules.tar.gz
+            .output/.config
+          include-hidden-files: true
