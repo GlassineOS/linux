@@ -330,9 +330,18 @@ static bool qcom_adreno_can_do_ttbr1(struct arm_smmu_device *smmu)
 	const struct device_node *np = smmu->dev->of_node;
 
 	if (of_device_is_compatible(np, "qcom,msm8996-smmu-v2") ||
-	    of_device_is_compatible(np, "qcom,msm8998-smmu-v2") ||
-	    of_device_is_compatible(np, "qcom,sdm630-smmu-v2"))
+	    of_device_is_compatible(np, "qcom,msm8998-smmu-v2"))
 		return false;
+
+	/*
+	 * NA1: the sdm630/sdm660 GPU SMMU is kept off TTBR1 upstream only
+	 * because drm/msm has no per-process pagetables on a5xx (the db820c
+	 * commit of 2021-06-08 says so for msm8996). The board opts in while
+	 * the a5xx side (drm/msm a5xx_gpu.c, msm.a5xx_pp_pgtables) is tested;
+	 * without the property nothing changes.
+	 */
+	if (of_device_is_compatible(np, "qcom,sdm630-smmu-v2"))
+		return of_property_read_bool(np, "na1,adreno-ttbr1");
 
 	return true;
 }
