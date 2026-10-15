@@ -1036,11 +1036,66 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	return 0;
 }
 
+/*
+ * NA1: the ring the CP is really on is the one at CP_RB_BASE, which can
+ * differ from cur_ring while a preemption is in flight or after one went
+ * wrong (kgsl adreno_dispatch.c picks the hung ring the same way). NULL if
+ * no ring matches. Reads registers: the GPU must be powered.
+ */
+static struct msm_ringbuffer *a5xx_hw_ring(struct msm_gpu *gpu, u64 *base)
+{
+	int i;
+
+	*base = gpu_read64(gpu, REG_A5XX_CP_RB_BASE);
+
+	for (i = 0; i < gpu->nr_rings; i++)
+		if (gpu->rb[i]->iova == *base)
+			return gpu->rb[i];
+
+	return NULL;
+}
+
+/* NA1: ring and preemption state for the fault and recover logs */
+static void a5xx_dump_rings(struct msm_gpu *gpu, const char *why,
+		struct msm_ringbuffer *hw, u64 base)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+	struct drm_device *dev = gpu->dev;
+	struct msm_ringbuffer *cur = a5xx_gpu->cur_ring;
+	struct msm_ringbuffer *next = a5xx_gpu->next_ring;
+	int i;
+
+	DRM_DEV_ERROR(dev->dev, "%s: %s: hw rb %d (CP_RB_BASE %llx), cur rb %d, next rb %d, preempt state %d\n",
+		gpu->name, why, hw ? hw->id : -1, base,
+		cur ? cur->id : -1, next ? next->id : -1,
+		atomic_read(&a5xx_gpu->preempt_state));
+
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+		struct a5xx_preempt_record *rec =
+			gpu->nr_rings > 1 ? a5xx_gpu->preempt[i] : NULL;
+
+		DRM_DEV_ERROR(dev->dev, "%s:     rb %d: fence %u/%u wptr %u shadow rptr %d record rptr/wptr %d/%d\n",
+			gpu->name, ring->id, ring->memptrs->fence,
+			ring->fctx->last_fence, get_wptr(ring),
+			a5xx_gpu->has_whereami && a5xx_gpu->shadow ?
+				(int)a5xx_gpu->shadow[i] : -1,
+			rec ? (int)rec->rptr : -1, rec ? (int)rec->wptr : -1);
+	}
+}
+
 static void a5xx_recover(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+	struct msm_ringbuffer *hw;
+	u64 base;
 	int i;
+
+	/* NA1: what the CP was really doing, before the reset clears it */
+	hw = a5xx_hw_ring(gpu, &base);
+	a5xx_dump_rings(gpu, "recover", hw, base);
 
 	/*
 	 * NA1: leave no preemption in flight across the reset. A stale timer
@@ -1272,8 +1327,12 @@ static void a5xx_gpmu_err_irq(struct msm_gpu *gpu)
 
 static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 {
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	struct drm_device *dev = gpu->dev;
 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+	struct msm_ringbuffer *hw;
+	u64 base;
 
 	/*
 	 * If stalled on SMMU fault, we could trip the GPU's hang detection,
@@ -1283,6 +1342,21 @@ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 	 */
 	if (gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24))
 		return;
+
+	hw = a5xx_hw_ring(gpu, &base);
+	a5xx_dump_rings(gpu, "hang detect", hw, base);
+
+	/*
+	 * NA1: blame the ring the CP hung on. The recover worker looks for
+	 * the offending submit on active_ring(), i.e. cur_ring (kgsl
+	 * adreno_dispatch.c moves cur_rb to the hung ring the same way).
+	 */
+	if (hw && hw != ring) {
+		DRM_DEV_ERROR(dev->dev, "%s: hw is on rb %d, not rb %d: blaming rb %d\n",
+			gpu->name, hw->id, ring ? ring->id : -1, hw->id);
+		a5xx_gpu->cur_ring = hw;
+		ring = hw;
+	}
 
 	DRM_DEV_ERROR(dev->dev, "gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
 		ring ? ring->id : -1, ring ? ring->fctx->last_fence : 0,
