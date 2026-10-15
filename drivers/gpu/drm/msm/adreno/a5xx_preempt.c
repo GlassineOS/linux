@@ -2,6 +2,8 @@
 /* Copyright (c) 2017 The Linux Foundation. All rights reserved.
  */
 
+#include <linux/pm_runtime.h>
+
 #include "msm_gem.h"
 #include "a5xx_gpu.h"
 
@@ -83,6 +85,30 @@ static void a5xx_preempt_timer(struct timer_list *t)
 						       preempt_timer);
 	struct msm_gpu *gpu = &a5xx_gpu->base.base;
 	struct drm_device *dev = gpu->dev;
+
+	if (atomic_read(&a5xx_gpu->preempt_state) != PREEMPT_TRIGGERED)
+		return;
+
+	/*
+	 * NA1: if the GPU is powered, look at the switch once more before
+	 * declaring a fault (as kgsl's _a5xx_preemption_fault): a
+	 * CP_CONTEXT_SWITCH_CNTL of 0 means the switch completed and only its
+	 * interrupt went missing. Finish it the way the irq would; the
+	 * TRIGGERED -> PENDING cmpxchg in a5xx_preempt_irq lets exactly one
+	 * of us (timer or a late irq) complete it.
+	 */
+	if (pm_runtime_get_if_active(&gpu->pdev->dev) > 0) {
+		u32 status = gpu_read(gpu, REG_A5XX_CP_CONTEXT_SWITCH_CNTL);
+
+		if (!status) {
+			DRM_DEV_ERROR(dev->dev, "%s: preemption completed without an interrupt\n",
+				      gpu->name);
+			a5xx_preempt_irq(gpu);
+			pm_runtime_put_autosuspend(&gpu->pdev->dev);
+			return;
+		}
+		pm_runtime_put_autosuspend(&gpu->pdev->dev);
+	}
 
 	if (!try_preempt_state(a5xx_gpu, PREEMPT_TRIGGERED, PREEMPT_FAULTED))
 		return;
@@ -222,6 +248,7 @@ void a5xx_preempt_hw_init(struct msm_gpu *gpu)
 
 	/* Always come up on rb 0 */
 	a5xx_gpu->cur_ring = gpu->rb[0];
+	a5xx_gpu->next_ring = NULL;
 
 	/* No preemption if we only have one ring */
 	if (gpu->nr_rings == 1)
