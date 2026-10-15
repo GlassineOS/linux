@@ -389,8 +389,19 @@ static void msm_gpu_crashstate_capture(struct msm_gpu *gpu,
 		struct msm_gpu_fault_info *info = &state->fault_info;
 		struct msm_mmu *mmu = to_msm_vm(submit->vm)->mmu;
 
-		msm_iommu_pagetable_params(mmu, &info->pgtbl_ttbr0,
-					   &info->asid);
+		if (!msm_iommu_pagetable_params(mmu, &info->pgtbl_ttbr0,
+						&info->asid) &&
+		    (info->ttbr0 & GENMASK_ULL(47, 0)) !=
+		    (info->pgtbl_ttbr0 & GENMASK_ULL(47, 0)))
+			/*
+			 * NA1: the SMMU faulted in another process's pagetable
+			 * than the one of the submit blamed below (fence + 1
+			 * on the active ring). The fault counts go to the
+			 * blamed one; this line keeps the two apart in the log.
+			 */
+			DRM_DEV_ERROR(gpu->dev->dev, "%s: fault ttbr0 %llx is not the blamed submit's pagetable %llx\n",
+				      gpu->name, info->ttbr0 & GENMASK_ULL(47, 0),
+				      (u64)info->pgtbl_ttbr0);
 		msm_iommu_pagetable_walk(mmu, info->iova, info->ptes);
 	}
 

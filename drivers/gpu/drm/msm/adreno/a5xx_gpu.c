@@ -9,6 +9,9 @@
 #include <linux/pm_opp.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/slab.h>
+#include <linux/bitfield.h>
+#include <linux/io-pgtable.h>
+#include <linux/adreno-smmu-priv.h>
 #include "msm_gem.h"
 #include "msm_mmu.h"
 #include "a5xx_gpu.h"
@@ -17,6 +20,131 @@ extern bool hang_debug;
 static void a5xx_dump(struct msm_gpu *gpu);
 
 #define GPU_PAS_ID 13
+
+/*
+ * Per-process GPU pagetables on a5xx (NA1, 2026-10-15). Feature switch,
+ * default OFF: the image behaves as before until BOTH
+ *   - the GPU SMMU runs the TTBR1 split (DT property na1,adreno-ttbr1 on
+ *     the kgsl_smmu node; arm-smmu-qcom.c qcom_adreno_can_do_ttbr1), and
+ *   - msm.a5xx_pp_pgtables=1.
+ * With the split alone, the kernel VM moves to TTBR1 (addresses with bit 48
+ * set) and nothing else changes: that is the first bring-up stage. With
+ * both, every DRM file gets its own TTBR0 pagetable, switched from the ring
+ * by CP_SMMU_TABLE_UPDATE as on a6xx and in kgsl's a5xx path, and the CP
+ * restores TTBR0 on a preemption from the SMMU info record (a5xx_preempt.c).
+ */
+static bool a5xx_pp_pgtables;
+MODULE_PARM_DESC(a5xx_pp_pgtables, "A5xx: per-process GPU pagetables (needs the TTBR1 split in the GPU SMMU; default 0)");
+module_param(a5xx_pp_pgtables, bool, 0444);
+
+bool a5xx_pp_pgtables_active(struct msm_gpu *gpu)
+{
+	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(&gpu->pdev->dev);
+	const struct io_pgtable_cfg *ttbr1_cfg;
+
+	if (!a5xx_pp_pgtables)
+		return false;
+
+	if (!adreno_smmu || !adreno_smmu->cookie || !adreno_smmu->get_ttbr1_cfg)
+		return false;
+
+	ttbr1_cfg = adreno_smmu->get_ttbr1_cfg(adreno_smmu->cookie);
+
+	return ttbr1_cfg && (ttbr1_cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1);
+}
+
+static struct drm_gpuvm *
+a5xx_create_private_vm(struct msm_gpu *gpu, bool kernel_managed)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+	struct msm_mmu *mmu;
+
+	/* an error here makes msm_gpu_create_private_vm hand out the kernel VM */
+	if (!a5xx_pp_pgtables_active(gpu))
+		return ERR_PTR(-ENODEV);
+
+	/* with preemption, the CP must be able to switch TTBR0 on a ring switch */
+	if (gpu->nr_rings > 1 && !a5xx_gpu->smmu_info)
+		return ERR_PTR(-ENODEV);
+
+	mmu = msm_iommu_pagetable_create(to_msm_vm(gpu->vm)->mmu, kernel_managed);
+	if (IS_ERR(mmu))
+		return ERR_CAST(mmu);
+
+	return msm_gem_vm_create(gpu->dev, mmu, "gpu", ADRENO_VM_START,
+				 adreno_private_vm_size(gpu), kernel_managed);
+}
+
+/*
+ * Switch TTBR0 to the submitting context's pagetable, from the ring, the way
+ * kgsl's _adreno_iommu_set_pt_v2_a5xx does: protected mode off (CP_CNTL is
+ * in the protected 0x800 range), CP_CNTL.APRIV on, drain (WAIT_FOR_IDLE,
+ * WAIT_FOR_ME), CP_SMMU_TABLE_UPDATE (3 dwords on a5xx: TTBR0 lo, TTBR0 hi,
+ * CONTEXTIDR; the ASID rides in TTBR0[63:48]), the new TTBR0 into the
+ * ring's memptrs for a5xx_preempt_trigger, WAIT_FOR_ME, kgsl's a5xx
+ * cp_invalidate_state, APRIV off, protected mode on. Contexts on the kernel
+ * VM (no private pagetable) switch nothing: all their addresses are in
+ * TTBR1. The sequence stalls the pipeline (WAIT_FOR_IDLE), so it runs only
+ * when the context changes on this ring (ring->cur_ctx_seqno).
+ */
+static void a5xx_set_pagetable(struct msm_gpu *gpu, struct msm_ringbuffer *ring,
+		struct msm_gem_submit *submit)
+{
+	struct msm_context *ctx = submit->queue->ctx;
+	struct drm_gpuvm *vm = msm_context_vm(submit->dev, ctx);
+	u64 memptr = rbmemptr(ring, ttbr0);
+	phys_addr_t ttbr;
+	u64 ttbr0;
+	int asid;
+
+	if (ctx->seqno == ring->cur_ctx_seqno)
+		return;
+
+	if (msm_iommu_pagetable_params(to_msm_vm(vm)->mmu, &ttbr, &asid))
+		return;
+
+	ttbr0 = (u64)ttbr | FIELD_PREP(GENMASK_ULL(63, 48), (u64)asid);
+
+	/* Turn off protected mode to write CP_CNTL */
+	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
+	OUT_RING(ring, 0);
+
+	/* CP_CNTL.APRIV: the CP's own accesses are privileged while it switches */
+	OUT_PKT4(ring, REG_A5XX_CP_CNTL, 1);
+	OUT_RING(ring, 1);
+
+	OUT_PKT7(ring, CP_WAIT_FOR_IDLE, 0);
+	OUT_PKT7(ring, CP_WAIT_FOR_ME, 0);
+
+	/* The CP switches the pagetable and flushes the caches */
+	OUT_PKT7(ring, CP_SMMU_TABLE_UPDATE, 3);
+	OUT_RING(ring, lower_32_bits(ttbr0));
+	OUT_RING(ring, upper_32_bits(ttbr0));
+	OUT_RING(ring, 0);	/* CONTEXTIDR: unused with aarch64 pagetables */
+
+	/* Record the new TTBR0 (+ context_idr) in the ring's memptrs */
+	OUT_PKT7(ring, CP_MEM_WRITE, 5);
+	OUT_RING(ring, lower_32_bits(memptr));
+	OUT_RING(ring, upper_32_bits(memptr));
+	OUT_RING(ring, lower_32_bits(ttbr0));
+	OUT_RING(ring, upper_32_bits(ttbr0));
+	OUT_RING(ring, 0);
+
+	OUT_PKT7(ring, CP_WAIT_FOR_ME, 0);
+
+	/* kgsl's cp_invalidate_state for a5xx: drop every draw state binding */
+	OUT_PKT7(ring, CP_SET_DRAW_STATE, 3);
+	OUT_RING(ring, 0x40000);
+	OUT_RING(ring, 0);
+	OUT_RING(ring, 0);
+
+	OUT_PKT4(ring, REG_A5XX_CP_CNTL, 1);
+	OUT_RING(ring, 0);
+
+	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
+	OUT_RING(ring, 1);
+}
 
 static void update_shadow_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 {
@@ -132,6 +260,9 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	unsigned int i, ibs = 0;
 
 	adreno_check_and_reenable_stall(adreno_gpu);
+
+	/* per-process pagetables: first thing in the submit (as on a6xx) */
+	a5xx_set_pagetable(gpu, ring, submit);
 
 	if (IS_ENABLED(CONFIG_DRM_MSM_GPU_SUDO) && submit->in_rb) {
 		ring->cur_ctx_seqno = 0;
@@ -974,6 +1105,25 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 
 	a5xx_preempt_hw_init(gpu);
 
+	/*
+	 * Per-process pagetables: TTBR0 is no longer what the CP last set.
+	 * The GX GDSC hangs off the SMMU node, so a GX collapse is an SMMU
+	 * runtime resume too, and arm_smmu_runtime_resume ->
+	 * arm_smmu_device_reset rewrites the context bank from the driver's
+	 * cache: the FIRST private pagetable ever created (possibly freed by
+	 * now). So the next submit on every ring must switch again (as
+	 * a6xx_hw_init), and the memptrs must not claim a stale table for
+	 * the preemption record. Gated: with the feature off, a reset
+	 * cur_ctx_seqno would only re-emit CTX_RESTORE_BUF IBs for nothing.
+	 */
+	if (a5xx_pp_pgtables_active(gpu)) {
+		for (unsigned int i = 0; i < gpu->nr_rings; i++) {
+			gpu->rb[i]->cur_ctx_seqno = 0;
+			gpu->rb[i]->memptrs->ttbr0 = 0;
+			gpu->rb[i]->memptrs->context_idr = 0;
+		}
+	}
+
 	/* Disable the interrupts through the initial bringup stage */
 	gpu_write(gpu, REG_A5XX_RBBM_INT_0_MASK, A5XX_INT_MASK);
 
@@ -1216,6 +1366,23 @@ static int a5xx_fault_handler(void *arg, unsigned long iova, int flags, void *da
 
 	if (info)
 		snprintf(block, sizeof(block), "%x", info->fsynr1);
+
+	/*
+	 * Per-process pagetables: name the ring whose last CP_SMMU_TABLE_UPDATE
+	 * wrote the faulting TTBR0 (the fault's process), independent of the
+	 * submit the recover worker will blame (fence + 1 on the active ring).
+	 */
+	if (info && info->ttbr0 && a5xx_pp_pgtables_active(gpu)) {
+		int i;
+
+		for (i = 0; i < gpu->nr_rings; i++) {
+			struct msm_ringbuffer *ring = gpu->rb[i];
+
+			if (ring->memptrs->ttbr0 == info->ttbr0)
+				pr_warn_ratelimited("*** gpu fault: ttbr0 belongs to rb %d (last ctx %u)\n",
+						    i, ring->cur_ctx_seqno);
+		}
+	}
 
 	return adreno_fault_handler(gpu, iova, flags, info, block, scratch);
 }
@@ -2036,6 +2203,7 @@ const struct adreno_gpu_funcs a5xx_gpu_funcs = {
 		.gpu_state_get = a5xx_gpu_state_get,
 		.gpu_state_put = a5xx_gpu_state_put,
 		.create_vm = adreno_create_vm,
+		.create_private_vm = a5xx_create_private_vm,
 		.get_rptr = a5xx_get_rptr,
 	},
 	.init = a5xx_gpu_init,

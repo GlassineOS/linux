@@ -46,9 +46,39 @@ struct a5xx_gpu {
 
 	/* True if the microcode supports the WHERE_AM_I opcode */
 	bool has_whereami;
+
+	/*
+	 * Per-process pagetables (NA1): the SMMU info record the CP reads
+	 * when a ring switch has to switch TTBR0 as well (kgsl's
+	 * iommu->smmu_info). NULL when preemption is off or the allocation
+	 * failed; private VMs are refused then.
+	 */
+	struct drm_gem_object *smmu_info_bo;
+	struct a5xx_cp_smmu_info *smmu_info;
+	uint64_t smmu_info_iova;
 };
 
 #define to_a5xx_gpu(x) container_of(x, struct a5xx_gpu, base)
+
+/*
+ * struct a5xx_cp_smmu_info - CP preemption SMMU info (kgsl adreno_a5xx.h).
+ * @magic: must be A5XX_CP_SMMU_INFO_MAGIC
+ * @ttbr0: TTBR0 (incl. the ASID bits) for the incoming ring
+ * @asid: not used by the CP
+ * @context_idr: CONTEXTIDR for the incoming ring (0, aarch64 pagetables)
+ */
+struct a5xx_cp_smmu_info {
+	uint32_t magic;
+	uint32_t _pad4;
+	uint64_t ttbr0;
+	uint32_t asid;
+	uint32_t context_idr;
+};
+
+#define A5XX_CP_SMMU_INFO_MAGIC 0x3618CDA3UL
+
+/* true when the feature switch is on AND the SMMU runs the TTBR1 split */
+bool a5xx_pp_pgtables_active(struct msm_gpu *gpu);
 
 #ifdef CONFIG_DEBUG_FS
 void a5xx_debugfs_init(struct msm_gpu *gpu, struct drm_minor *minor);

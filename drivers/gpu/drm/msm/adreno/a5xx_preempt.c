@@ -173,6 +173,20 @@ void a5xx_preempt_trigger(struct msm_gpu *gpu)
 	/* Make sure the wptr doesn't update while we're in motion */
 	spin_lock_irqsave(&ring->preempt_lock, flags);
 	a5xx_gpu->preempt[ring->id]->wptr = get_wptr(ring);
+
+	/*
+	 * Per-process pagetables (NA1): the CP restores TTBR0 from the SMMU
+	 * info record when it switches rings (kgsl a5xx_preemption_trigger).
+	 * The incoming ring's memptrs hold the TTBR0 its own CP_SMMU_TABLE_
+	 * UPDATE wrote last; 0 for a ring that never switched (all of its
+	 * contexts use the kernel VM in TTBR1, so TTBR0 is never walked).
+	 * A ring whose newest submit has not run its switch yet is fine too:
+	 * that switch is the first thing in the submit.
+	 */
+	if (a5xx_gpu->smmu_info) {
+		a5xx_gpu->smmu_info->ttbr0 = ring->memptrs->ttbr0;
+		a5xx_gpu->smmu_info->context_idr = ring->memptrs->context_idr;
+	}
 	spin_unlock_irqrestore(&ring->preempt_lock, flags);
 
 	/* Set the address of the incoming preemption record */
@@ -263,8 +277,26 @@ void a5xx_preempt_hw_init(struct msm_gpu *gpu)
 		a5xx_gpu->preempt[i]->rptr_addr = shadowptr(a5xx_gpu, gpu->rb[i]);
 	}
 
-	/* Write a 0 to signal that we aren't switching pagetables */
-	gpu_write64(gpu, REG_A5XX_CP_CONTEXT_SWITCH_SMMU_INFO_LO, 0);
+	/*
+	 * Per-process pagetables (NA1): point the CP at the SMMU info record
+	 * so a ring switch also switches TTBR0 (kgsl a5xx_preemption_start).
+	 * The record starts out as "kernel VM": ttbr0 0 is never walked while
+	 * every ring is on TTBR1; the first submit with a private VM switches
+	 * and writes its ring's memptrs, which the trigger copies here.
+	 */
+	if (a5xx_gpu->smmu_info && a5xx_pp_pgtables_active(gpu)) {
+		a5xx_gpu->smmu_info->magic = A5XX_CP_SMMU_INFO_MAGIC;
+		a5xx_gpu->smmu_info->_pad4 = 0;
+		a5xx_gpu->smmu_info->ttbr0 = 0;
+		/* the CP does not use the asid field; poison it like kgsl */
+		a5xx_gpu->smmu_info->asid = 0xdecafbad;
+		a5xx_gpu->smmu_info->context_idr = 0;
+		gpu_write64(gpu, REG_A5XX_CP_CONTEXT_SWITCH_SMMU_INFO_LO,
+			    a5xx_gpu->smmu_info_iova);
+	} else {
+		/* Write a 0 to signal that we aren't switching pagetables */
+		gpu_write64(gpu, REG_A5XX_CP_CONTEXT_SWITCH_SMMU_INFO_LO, 0);
+	}
 
 	/* Reset the preemption state */
 	set_preempt_state(a5xx_gpu, PREEMPT_NONE);
@@ -326,6 +358,43 @@ void a5xx_preempt_fini(struct msm_gpu *gpu)
 		msm_gem_kernel_put(a5xx_gpu->preempt_bo[i], gpu->vm);
 		msm_gem_kernel_put(a5xx_gpu->preempt_counters_bo[i], gpu->vm);
 	}
+
+	if (a5xx_gpu->smmu_info_bo) {
+		msm_gem_kernel_put(a5xx_gpu->smmu_info_bo, gpu->vm);
+		a5xx_gpu->smmu_info_bo = NULL;
+		a5xx_gpu->smmu_info = NULL;
+	}
+}
+
+/*
+ * Per-process pagetables (NA1): one SMMU info record for the CP, as kgsl's
+ * iommu->smmu_info (a5xx_preemption_iommu_init). Read by the CP during a
+ * ring switch, written by the CPU in a5xx_preempt_trigger, so privileged
+ * and GPU read-only. Preemption works without it (the CP then leaves TTBR0
+ * alone); a failure here only means no pagetable switch on preemption, so
+ * a5xx_create_private_vm refuses private VMs when it is missing.
+ */
+static int preempt_init_smmu_info(struct a5xx_gpu *a5xx_gpu)
+{
+	struct msm_gpu *gpu = &a5xx_gpu->base.base;
+	struct drm_gem_object *bo = NULL;
+	u64 iova = 0;
+	void *ptr;
+
+	ptr = msm_gem_kernel_new(gpu->dev, PAGE_SIZE,
+		MSM_BO_WC | MSM_BO_MAP_PRIV | MSM_BO_GPU_READONLY,
+		gpu->vm, &bo, &iova);
+	if (IS_ERR(ptr))
+		return PTR_ERR(ptr);
+
+	memset(ptr, 0, PAGE_SIZE);
+	msm_gem_object_set_name(bo, "preempt_smmu_info");
+
+	a5xx_gpu->smmu_info_bo = bo;
+	a5xx_gpu->smmu_info_iova = iova;
+	a5xx_gpu->smmu_info = ptr;
+
+	return 0;
 }
 
 void a5xx_preempt_init(struct msm_gpu *gpu)
@@ -350,6 +419,11 @@ void a5xx_preempt_init(struct msm_gpu *gpu)
 			return;
 		}
 	}
+
+	/* optional: preemption itself does not need it (see above) */
+	if (preempt_init_smmu_info(a5xx_gpu))
+		DRM_DEV_ERROR(gpu->dev->dev, "%s: no SMMU info record: no per-process pagetables\n",
+			      gpu->name);
 
 	spin_lock_init(&a5xx_gpu->preempt_start_lock);
 	timer_setup(&a5xx_gpu->preempt_timer, a5xx_preempt_timer, 0);
