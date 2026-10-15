@@ -833,8 +833,23 @@ void msm_gpu_retire(struct msm_gpu *gpu)
 {
 	int i;
 
-	for (i = 0; i < gpu->nr_rings; i++)
-		msm_update_fence(gpu->rb[i]->fctx, gpu->rb[i]->memptrs->fence);
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+		uint32_t fence = ring->memptrs->fence;
+
+		/*
+		 * NA1: the GPU writes memptrs->fence and it only ever moves
+		 * forward. Backwards means a stale CP (or record) wrote it;
+		 * msm_update_fence ignores it, the hangcheck would not.
+		 */
+		if (fence_before(fence, ring->fctx->completed_fence))
+			dev_warn_once(gpu->dev->dev,
+				"%s: rb %d fence went backwards: %u < completed %u\n",
+				gpu->name, ring->id, fence,
+				ring->fctx->completed_fence);
+
+		msm_update_fence(ring->fctx, fence);
+	}
 
 	kthread_queue_work(gpu->worker, &gpu->retire_work);
 }
