@@ -1038,7 +1038,25 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 
 static void a5xx_recover(struct msm_gpu *gpu)
 {
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	int i;
+
+	/*
+	 * NA1: leave no preemption in flight across the reset. A stale timer
+	 * would fault the fresh state again, and a PREEMPT_FAULTED that
+	 * survived (the recover worker used to bail without calling us) keeps
+	 * a5xx_flush from ever writing CP_RB_WPTR (900E, 2026-10-15).
+	 * hw_init sets cur_ring and the state again; this makes it hold even
+	 * if hw_init fails.
+	 */
+	if (gpu->nr_rings > 1) {
+		timer_delete_sync(&a5xx_gpu->preempt_timer);
+		a5xx_gpu->next_ring = NULL;
+		smp_mb__before_atomic();
+		atomic_set(&a5xx_gpu->preempt_state, PREEMPT_NONE);
+		smp_mb__after_atomic();
+	}
 
 	adreno_dump_info(gpu);
 
