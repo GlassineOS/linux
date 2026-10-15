@@ -668,31 +668,64 @@ static void hangcheck_handler(struct timer_list *t)
 {
 	struct msm_gpu *gpu = timer_container_of(gpu, t, hangcheck_timer);
 	struct drm_device *dev = gpu->dev;
-	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
-	uint32_t fence = ring->memptrs->fence;
+	struct msm_ringbuffer *cur_ring = gpu->funcs->active_ring(gpu);
+	struct msm_ringbuffer *stuck = NULL;
+	bool progress = false, pending = false;
+	int i;
 
-	if (fence != ring->hangcheck_fence) {
-		/* some progress has been made.. ya! */
-		ring->hangcheck_fence = fence;
-		ring->hangcheck_progress_retries = 0;
-	} else if (fence_before(fence, ring->fctx->last_fence) &&
-			!made_progress(gpu, ring)) {
+	/*
+	 * NA1: look at every ring, not only the active one. With preemption
+	 * (a5xx, four rings) the work can sit on a ring that is not
+	 * cur_ring, e.g. after a preemption went wrong; checking cur_ring
+	 * alone never saw it and the fences stayed stuck (900E, 2026-10-15).
+	 * Fence progress on any ring counts as progress, so a ring that
+	 * merely waits for its turn is no lockup.
+	 */
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+		uint32_t fence = ring->memptrs->fence;
+
+		if (fence != ring->hangcheck_fence) {
+			/* some progress has been made.. ya! */
+			ring->hangcheck_fence = fence;
+			ring->hangcheck_progress_retries = 0;
+			progress = true;
+		}
+
+		if (fence_before(fence, ring->fctx->last_fence)) {
+			pending = true;
+			/* name the active ring if it is stuck, else the first */
+			if (!stuck || ring == cur_ring)
+				stuck = ring;
+		}
+	}
+
+	if (pending && !progress && !made_progress(gpu, cur_ring)) {
 		/* no progress and not done.. hung! */
-		ring->hangcheck_fence = fence;
-		ring->hangcheck_progress_retries = 0;
+		for (i = 0; i < gpu->nr_rings; i++)
+			gpu->rb[i]->hangcheck_progress_retries = 0;
 		DRM_DEV_ERROR(dev->dev, "%s: hangcheck detected gpu lockup rb %d!\n",
-				gpu->name, ring->id);
+				gpu->name, stuck->id);
 		DRM_DEV_ERROR(dev->dev, "%s:     completed fence: %u\n",
-				gpu->name, fence);
+				gpu->name, stuck->memptrs->fence);
 		DRM_DEV_ERROR(dev->dev, "%s:     submitted fence: %u\n",
-				gpu->name, ring->fctx->last_fence);
+				gpu->name, stuck->fctx->last_fence);
+		if (stuck != cur_ring)
+			DRM_DEV_ERROR(dev->dev, "%s:     active rb: %d\n",
+					gpu->name, cur_ring->id);
 
 		kthread_queue_work(gpu->worker, &gpu->recover_work);
 	}
 
 	/* if still more pending work, reset the hangcheck timer: */
-	if (fence_after(ring->fctx->last_fence, ring->hangcheck_fence))
-		hangcheck_timer_reset(gpu);
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+
+		if (fence_after(ring->fctx->last_fence, ring->hangcheck_fence)) {
+			hangcheck_timer_reset(gpu);
+			break;
+		}
+	}
 
 	/* workaround for missing irq: */
 	msm_gpu_retire(gpu);
