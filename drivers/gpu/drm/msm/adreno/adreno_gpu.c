@@ -684,6 +684,18 @@ int adreno_hw_init(struct msm_gpu *gpu)
 		if (fence_before(ring->fctx->last_fence, ring->memptrs->fence)) {
 			ring->memptrs->fence = ring->fctx->last_fence;
 		}
+
+		/*
+		 * NA1: and one behind what the CPU already saw complete: the
+		 * hangcheck takes any change of memptrs->fence for progress,
+		 * and the recover worker looks up the submit at fence + 1.
+		 */
+		if (fence_before(ring->memptrs->fence, ring->fctx->completed_fence)) {
+			DRM_DEV_ERROR(gpu->dev->dev, "%s: rb %d fence %u behind completed %u, clamped\n",
+				gpu->name, ring->id, ring->memptrs->fence,
+				ring->fctx->completed_fence);
+			ring->memptrs->fence = ring->fctx->completed_fence;
+		}
 	}
 
 	return 0;
