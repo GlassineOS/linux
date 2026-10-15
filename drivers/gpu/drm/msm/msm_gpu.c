@@ -480,50 +480,68 @@ static void recover_worker(struct kthread_work *work)
 	submit = find_submit(cur_ring, cur_ring->memptrs->fence + 1);
 
 	/*
-	 * If the submit retired while we were waiting for the worker to run,
-	 * or waiting to acquire the gpu lock, then nothing more to do.
+	 * NA1: no submit at fence + 1 on the software current ring does not
+	 * mean the GPU is fine. On a5xx the preempt timer and the hang detect
+	 * irq queue this work too, and the hardware may sit on another ring
+	 * (a preemption that never completed): bailing out left
+	 * PREEMPT_FAULTED set forever, a5xx_flush never wrote CP_RB_WPTR
+	 * again, the fences stuck and a hung task panic followed (900E,
+	 * 2026-10-15). With nobody to blame, reset and replay anyway.
 	 */
-	if (!submit)
-		goto out_unlock;
+	if (!submit) {
+		DRM_DEV_ERROR(dev->dev, "%s: no submit to blame on rb %d (completed fence %u, submitted fence %u): resetting anyway\n",
+			      gpu->name, cur_ring->id, cur_ring->memptrs->fence,
+			      cur_ring->fctx->last_fence);
+		for (i = 0; i < gpu->nr_rings; i++) {
+			struct msm_ringbuffer *ring = gpu->rb[i];
 
-	/* Increment the fault counts */
-	submit->queue->faults++;
-
-	task = get_pid_task(submit->pid, PIDTYPE_PID);
-	if (!task)
-		gpu->global_faults++;
-	else {
-		struct msm_gem_vm *vm = to_msm_vm(submit->vm);
-
-		vm->faults++;
-
-		/*
-		 * If userspace has opted-in to VM_BIND (and therefore userspace
-		 * management of the VM), faults mark the VM as unusable. This
-		 * matches vulkan expectations (vulkan is the main target for
-		 * VM_BIND).
-		 */
-		if (!vm->managed)
-			msm_gem_vm_unusable(submit->vm);
+			if (ring != cur_ring)
+				DRM_DEV_ERROR(dev->dev, "%s:     rb %d: completed fence %u, submitted fence %u\n",
+					      gpu->name, ring->id, ring->memptrs->fence,
+					      ring->fctx->last_fence);
+		}
 	}
 
 	noreclaim_flag = memalloc_noreclaim_save();
 
-	get_comm_cmdline(submit, &comm, &cmd);
+	if (submit) {
+		/* Increment the fault counts */
+		submit->queue->faults++;
 
-	if (comm && cmd) {
-		DRM_DEV_ERROR(dev->dev, "%s: offending task: %s (%s)\n",
-			      gpu->name, comm, cmd);
+		task = get_pid_task(submit->pid, PIDTYPE_PID);
+		if (!task)
+			gpu->global_faults++;
+		else {
+			struct msm_gem_vm *vm = to_msm_vm(submit->vm);
 
-		msm_rd_dump_submit(priv->hangrd, submit,
-				   "offending task: %s (%s)", comm, cmd);
-	} else {
-		DRM_DEV_ERROR(dev->dev, "%s: offending task: unknown\n", gpu->name);
+			vm->faults++;
 
-		msm_rd_dump_submit(priv->hangrd, submit, NULL);
+			/*
+			 * If userspace has opted-in to VM_BIND (and therefore
+			 * userspace management of the VM), faults mark the VM
+			 * as unusable. This matches vulkan expectations
+			 * (vulkan is the main target for VM_BIND).
+			 */
+			if (!vm->managed)
+				msm_gem_vm_unusable(submit->vm);
+		}
+
+		get_comm_cmdline(submit, &comm, &cmd);
+
+		if (comm && cmd) {
+			DRM_DEV_ERROR(dev->dev, "%s: offending task: %s (%s)\n",
+				      gpu->name, comm, cmd);
+
+			msm_rd_dump_submit(priv->hangrd, submit,
+					   "offending task: %s (%s)", comm, cmd);
+		} else {
+			DRM_DEV_ERROR(dev->dev, "%s: offending task: unknown\n", gpu->name);
+
+			msm_rd_dump_submit(priv->hangrd, submit, NULL);
+		}
 	}
 
-	/* Record the crash state */
+	/* Record the crash state (tolerates submit == NULL) */
 	pm_runtime_get_sync(&gpu->pdev->dev);
 	msm_gpu_crashstate_capture(gpu, submit, NULL, comm, cmd);
 
@@ -546,7 +564,7 @@ static void recover_worker(struct kthread_work *work)
 		 * For the current (faulting?) ring/submit advance the fence by
 		 * one more to clear the faulting submit
 		 */
-		if (ring == cur_ring)
+		if (submit && ring == cur_ring)
 			ring->memptrs->fence = ++fence;
 
 		msm_update_fence(ring->fctx, fence);
@@ -580,7 +598,6 @@ static void recover_worker(struct kthread_work *work)
 
 	pm_runtime_put(&gpu->pdev->dev);
 
-out_unlock:
 	mutex_unlock(&gpu->lock);
 
 	msm_gpu_retire(gpu);
