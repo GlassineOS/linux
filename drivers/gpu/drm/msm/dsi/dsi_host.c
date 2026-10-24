@@ -2556,7 +2556,6 @@ fail_put_rpm:
 	 * later lock failed too (panel dead until reboot).
 	 */
 	pm_runtime_put(&msm_host->pdev->dev);
-fail_disable_reg:
 	regulator_bulk_disable(msm_host->cfg_hnd->cfg->num_regulators,
 			       msm_host->supplies);
 unlock_ret:
