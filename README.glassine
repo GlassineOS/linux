@@ -2,13 +2,17 @@ GlassineOS kernel
 =================
 
 This branch is the kernel of GlassineOS (https://github.com/GlassineOS):
-the sdm660-mainline kernel (https://github.com/sdm660-mainline/linux, base
-d52542d28026) plus the patches, device trees and config fragments the
-GlassineOS images build.
+Linux 7.3 with the sdm660-mainline patches (https://github.com/sdm660-mainline/linux)
+plus the patches, device trees and config fragments the GlassineOS images
+build. sdm660-mainline has no 7.3 branch yet: its qcom-sdm660-7.2.y
+(76320327ccdf) is rebased here onto v7.3 (base tip 4a62016f6636), without
+the commits 7.3 already contains. When sdm660-mainline publishes
+qcom-sdm660-7.3.y, the GlassineOS patches are rebased onto it.
 
 Branches:
-  glassine/sdm660-7.2        what the images build
-  glassine/sdm660-7.2-debug  the same plus debug traces (not for daily use)
+  glassine/sdm660-7.2        what the images build (Linux 7.2.3)
+  glassine/sdm660-7.3        candidate for the images (not yet tested on a device)
+  glassine/sdm660-7.3-debug  the same plus debug traces (not for daily use)
 
 Build (arm64 cross compiler; GlassineOS uses ghcr.io/glassineos/kernel-build):
 
