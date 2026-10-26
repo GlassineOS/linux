@@ -686,8 +686,15 @@ static int qca_check_bdaddr(struct hci_dev *hdev, const struct qca_fw_config *co
 	struct sk_buff *skb;
 	int err;
 
-	if (bacmp(&hdev->public_addr, BDADDR_ANY))
+	/* An address set by userspace or a property must survive a
+	 * re-setup (HCI_QUIRK_NON_PERSISTENT_SETUP): the chip may come
+	 * back with another address (seen on WCN3990), and only this
+	 * quirk makes hci_dev_setup_sync() program public_addr again.
+	 */
+	if (bacmp(&hdev->public_addr, BDADDR_ANY)) {
+		hci_set_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
 		return 0;
+	}
 
 	skb = __hci_cmd_sync(hdev, HCI_OP_READ_BD_ADDR, 0, NULL,
 			     HCI_INIT_TIMEOUT);
