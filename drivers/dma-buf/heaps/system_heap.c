@@ -225,6 +225,120 @@ static int system_heap_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
 	return 0;
 }
 
+/*
+ * Sync the bytes [offset, offset + len) of one mapped attachment, piece by
+ * piece. A piece is cut at the buffer's page chunks (the sg_table entries,
+ * each physically contiguous) and addressed through the DMA segments. An
+ * IOMMU may have merged several chunks into one DMA segment; it then covers
+ * them in order and without gaps, so a buffer offset maps linearly to a DMA
+ * address inside it (this assumes an IOVA granule of PAGE_SIZE: a larger one
+ * pads each chunk, which the table does not show). Returns false if the table
+ * does not have that shape:
+ * the caller then syncs the whole table (pieces already synced are harmless).
+ */
+static bool system_heap_sync_range(struct dma_heap_attachment *a,
+				   unsigned int offset, unsigned int len,
+				   enum dma_data_direction direction,
+				   bool for_cpu)
+{
+	struct sg_table *table = &a->table;
+	struct scatterlist *sg, *dsg = table->sgl;
+	unsigned long end = (unsigned long)offset + len;
+	unsigned long pos = 0, dpos = 0;
+	unsigned int di = 0;
+	int i;
+
+	if (!table->nents)
+		return false;
+
+	for_each_sgtable_sg(table, sg, i) {
+		unsigned long start, stop;
+		dma_addr_t addr;
+
+		if (pos >= end)
+			break;
+		start = max_t(unsigned long, offset, pos);
+		stop = min_t(unsigned long, end, pos + sg->length);
+		pos += sg->length;
+		if (start >= stop)
+			continue;
+
+		/* the DMA segment holding start */
+		while (dpos + sg_dma_len(dsg) <= start) {
+			dpos += sg_dma_len(dsg);
+			if (++di >= table->nents)
+				return false;
+			dsg = sg_next(dsg);
+		}
+		if (stop > dpos + sg_dma_len(dsg))
+			return false;
+
+		addr = sg_dma_address(dsg) + (start - dpos);
+		if (for_cpu)
+			dma_sync_single_for_cpu(a->dev, addr, stop - start,
+						direction);
+		else
+			dma_sync_single_for_device(a->dev, addr, stop - start,
+						   direction);
+	}
+
+	return true;
+}
+
+static int
+system_heap_dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
+					     enum dma_data_direction direction,
+					     unsigned int offset,
+					     unsigned int len)
+{
+	struct system_heap_buffer *buffer = dmabuf->priv;
+	struct dma_heap_attachment *a;
+
+	mutex_lock(&buffer->lock);
+
+	if (buffer->vmap_cnt)
+		invalidate_kernel_vmap_range(buffer->vaddr + offset, len);
+
+	list_for_each_entry(a, &buffer->attachments, list) {
+		if (!a->mapped)
+			continue;
+		if (system_heap_sync_range(a, offset, len, direction, true))
+			continue;
+		dev_dbg_ratelimited(a->dev, "range sync: whole table instead\n");
+		dma_sync_sgtable_for_cpu(a->dev, &a->table, direction);
+	}
+	mutex_unlock(&buffer->lock);
+
+	return 0;
+}
+
+static int
+system_heap_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
+					   enum dma_data_direction direction,
+					   unsigned int offset,
+					   unsigned int len)
+{
+	struct system_heap_buffer *buffer = dmabuf->priv;
+	struct dma_heap_attachment *a;
+
+	mutex_lock(&buffer->lock);
+
+	if (buffer->vmap_cnt)
+		flush_kernel_vmap_range(buffer->vaddr + offset, len);
+
+	list_for_each_entry(a, &buffer->attachments, list) {
+		if (!a->mapped)
+			continue;
+		if (system_heap_sync_range(a, offset, len, direction, false))
+			continue;
+		dev_dbg_ratelimited(a->dev, "range sync: whole table instead\n");
+		dma_sync_sgtable_for_device(a->dev, &a->table, direction);
+	}
+	mutex_unlock(&buffer->lock);
+
+	return 0;
+}
+
 static int system_heap_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 {
 	struct system_heap_buffer *buffer = dmabuf->priv;
@@ -369,6 +483,8 @@ static const struct dma_buf_ops system_heap_buf_ops = {
 	.unmap_dma_buf = system_heap_unmap_dma_buf,
 	.begin_cpu_access = system_heap_dma_buf_begin_cpu_access,
 	.end_cpu_access = system_heap_dma_buf_end_cpu_access,
+	.begin_cpu_access_partial = system_heap_dma_buf_begin_cpu_access_partial,
+	.end_cpu_access_partial = system_heap_dma_buf_end_cpu_access_partial,
 	.mmap = system_heap_mmap,
 	.vmap = system_heap_vmap,
 	.vunmap = system_heap_vunmap,
