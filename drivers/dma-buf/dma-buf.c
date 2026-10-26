@@ -537,11 +537,33 @@ static long dma_buf_import_sync_file(struct dma_buf *dmabuf,
 }
 #endif
 
+/* DMA_BUF_SYNC_* flags to the direction of the cpu access; -EINVAL if invalid */
+static int dma_buf_sync_direction(u64 flags, enum dma_data_direction *direction)
+{
+	if (flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
+		return -EINVAL;
+
+	switch (flags & DMA_BUF_SYNC_RW) {
+	case DMA_BUF_SYNC_READ:
+		*direction = DMA_FROM_DEVICE;
+		return 0;
+	case DMA_BUF_SYNC_WRITE:
+		*direction = DMA_TO_DEVICE;
+		return 0;
+	case DMA_BUF_SYNC_RW:
+		*direction = DMA_BIDIRECTIONAL;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static long dma_buf_ioctl(struct file *file,
 			  unsigned int cmd, unsigned long arg)
 {
 	struct dma_buf *dmabuf;
 	struct dma_buf_sync sync;
+	struct dma_buf_sync_partial sync_p;
 	enum dma_data_direction direction;
 	int ret;
 
@@ -552,27 +574,39 @@ static long dma_buf_ioctl(struct file *file,
 		if (copy_from_user(&sync, (void __user *) arg, sizeof(sync)))
 			return -EFAULT;
 
-		if (sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
-			return -EINVAL;
-
-		switch (sync.flags & DMA_BUF_SYNC_RW) {
-		case DMA_BUF_SYNC_READ:
-			direction = DMA_FROM_DEVICE;
-			break;
-		case DMA_BUF_SYNC_WRITE:
-			direction = DMA_TO_DEVICE;
-			break;
-		case DMA_BUF_SYNC_RW:
-			direction = DMA_BIDIRECTIONAL;
-			break;
-		default:
-			return -EINVAL;
-		}
+		ret = dma_buf_sync_direction(sync.flags, &direction);
+		if (ret)
+			return ret;
 
 		if (sync.flags & DMA_BUF_SYNC_END)
 			ret = dma_buf_end_cpu_access(dmabuf, direction);
 		else
 			ret = dma_buf_begin_cpu_access(dmabuf, direction);
+
+		return ret;
+
+	case DMA_BUF_IOCTL_SYNC_PARTIAL:
+		if (copy_from_user(&sync_p, (void __user *)arg, sizeof(sync_p)))
+			return -EFAULT;
+
+		ret = dma_buf_sync_direction(sync_p.flags, &direction);
+		if (ret)
+			return ret;
+
+		if ((u64)sync_p.offset + sync_p.len > dmabuf->size)
+			return -EINVAL;
+
+		if (sync_p.len == 0)
+			return 0;
+
+		if (sync_p.flags & DMA_BUF_SYNC_END)
+			ret = dma_buf_end_cpu_access_partial(dmabuf, direction,
+							     sync_p.offset,
+							     sync_p.len);
+		else
+			ret = dma_buf_begin_cpu_access_partial(dmabuf, direction,
+							       sync_p.offset,
+							       sync_p.len);
 
 		return ret;
 
@@ -1448,7 +1482,11 @@ EXPORT_SYMBOL_NS_GPL(dma_buf_invalidate_mappings, "DMA_BUF");
  *   fd. But like for CPU access there's a need to bracket the actual access,
  *   which is handled by the ioctl (DMA_BUF_IOCTL_SYNC). Note that
  *   DMA_BUF_IOCTL_SYNC can fail with -EAGAIN or -EINTR, in which case it must
- *   be restarted.
+ *   be restarted. DMA_BUF_IOCTL_SYNC_PARTIAL does the same for a byte range
+ *   of the buffer (&struct dma_buf_sync_partial): exporters with the
+ *   &dma_buf_ops.begin_cpu_access_partial and
+ *   &dma_buf_ops.end_cpu_access_partial hooks then maintain only that range,
+ *   the others the whole buffer.
  *
  *   Some systems might need some sort of cache coherency management e.g. when
  *   CPU and GPU domains are being accessed through dma-buf at the same time.
@@ -1584,6 +1622,86 @@ int dma_buf_end_cpu_access(struct dma_buf *dmabuf,
 	return ret;
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_end_cpu_access, "DMA_BUF");
+
+/**
+ * dma_buf_begin_cpu_access_partial - dma_buf_begin_cpu_access() for a range
+ * @dmabuf:	[in]	buffer to prepare cpu access for.
+ * @direction:	[in]	direction of access.
+ * @offset:	[in]	start of the range in bytes.
+ * @len:	[in]	length of the range in bytes.
+ *
+ * Like dma_buf_begin_cpu_access(), but coherency is only guaranteed for the
+ * bytes [@offset, @offset + @len). Exporters without
+ * &dma_buf_ops.begin_cpu_access_partial get &dma_buf_ops.begin_cpu_access,
+ * i.e. the whole buffer. The implicit fences are waited for in both cases.
+ *
+ * Returns 0 on success, -EINVAL if the range is outside the buffer, or the
+ * exporter's error.
+ */
+int dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
+				     enum dma_data_direction direction,
+				     unsigned int offset, unsigned int len)
+{
+	int ret = 0;
+
+	if (WARN_ON(!dmabuf))
+		return -EINVAL;
+
+	if ((u64)offset + len > dmabuf->size)
+		return -EINVAL;
+
+	might_lock(&dmabuf->resv->lock.base);
+
+	if (dmabuf->ops->begin_cpu_access_partial)
+		ret = dmabuf->ops->begin_cpu_access_partial(dmabuf, direction,
+							    offset, len);
+	else if (dmabuf->ops->begin_cpu_access)
+		ret = dmabuf->ops->begin_cpu_access(dmabuf, direction);
+
+	if (ret == 0)
+		ret = __dma_buf_begin_cpu_access(dmabuf, direction);
+
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_begin_cpu_access_partial, "DMA_BUF");
+
+/**
+ * dma_buf_end_cpu_access_partial - dma_buf_end_cpu_access() for a range
+ * @dmabuf:	[in]	buffer to complete cpu access for.
+ * @direction:	[in]	direction of access.
+ * @offset:	[in]	start of the range in bytes.
+ * @len:	[in]	length of the range in bytes.
+ *
+ * Terminates CPU access started with dma_buf_begin_cpu_access_partial() for
+ * the same range. Exporters without &dma_buf_ops.end_cpu_access_partial get
+ * &dma_buf_ops.end_cpu_access, i.e. the whole buffer.
+ *
+ * Returns 0 on success, -EINVAL if the range is outside the buffer, or the
+ * exporter's error.
+ */
+int dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
+				   enum dma_data_direction direction,
+				   unsigned int offset, unsigned int len)
+{
+	int ret = 0;
+
+	if (WARN_ON(!dmabuf))
+		return -EINVAL;
+
+	if ((u64)offset + len > dmabuf->size)
+		return -EINVAL;
+
+	might_lock(&dmabuf->resv->lock.base);
+
+	if (dmabuf->ops->end_cpu_access_partial)
+		ret = dmabuf->ops->end_cpu_access_partial(dmabuf, direction,
+							  offset, len);
+	else if (dmabuf->ops->end_cpu_access)
+		ret = dmabuf->ops->end_cpu_access(dmabuf, direction);
+
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_end_cpu_access_partial, "DMA_BUF");
 
 
 /**

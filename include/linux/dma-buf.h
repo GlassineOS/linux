@@ -239,6 +239,43 @@ struct dma_buf_ops {
 	int (*end_cpu_access)(struct dma_buf *, enum dma_data_direction);
 
 	/**
+	 * @begin_cpu_access_partial:
+	 *
+	 * Like @begin_cpu_access, but only the bytes [offset, offset + len)
+	 * of the buffer must be made coherent for cpu access. Called from
+	 * dma_buf_begin_cpu_access_partial(), which has checked the range
+	 * against &dma_buf.size and waits for the implicit fences afterwards.
+	 *
+	 * This callback is optional. Without it @begin_cpu_access is called,
+	 * i.e. the whole buffer is made coherent.
+	 *
+	 * Returns:
+	 *
+	 * 0 on success or a negative error code on failure, as
+	 * @begin_cpu_access.
+	 */
+	int (*begin_cpu_access_partial)(struct dma_buf *dmabuf,
+					enum dma_data_direction dir,
+					unsigned int offset, unsigned int len);
+
+	/**
+	 * @end_cpu_access_partial:
+	 *
+	 * Like @end_cpu_access, but only for the bytes [offset, offset + len)
+	 * of the buffer. Called from dma_buf_end_cpu_access_partial().
+	 *
+	 * This callback is optional. Without it @end_cpu_access is called.
+	 *
+	 * Returns:
+	 *
+	 * 0 on success or a negative error code on failure, as
+	 * @end_cpu_access.
+	 */
+	int (*end_cpu_access_partial)(struct dma_buf *dmabuf,
+				      enum dma_data_direction dir,
+				      unsigned int offset, unsigned int len);
+
+	/**
 	 * @mmap:
 	 *
 	 * This callback is used by the dma_buf_mmap() function
@@ -581,6 +618,12 @@ int dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
 			     enum dma_data_direction dir);
 int dma_buf_end_cpu_access(struct dma_buf *dma_buf,
 			   enum dma_data_direction dir);
+int dma_buf_begin_cpu_access_partial(struct dma_buf *dma_buf,
+				     enum dma_data_direction dir,
+				     unsigned int offset, unsigned int len);
+int dma_buf_end_cpu_access_partial(struct dma_buf *dma_buf,
+				   enum dma_data_direction dir,
+				   unsigned int offset, unsigned int len);
 struct sg_table *
 dma_buf_map_attachment_unlocked(struct dma_buf_attachment *attach,
 				enum dma_data_direction direction);

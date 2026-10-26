@@ -168,6 +168,27 @@ struct dma_buf_import_sync_file {
 	__s32 fd;
 };
 
+/**
+ * struct dma_buf_sync_partial - Synchronize a range with CPU access.
+ *
+ * Like &struct dma_buf_sync, but the cache maintenance covers only the bytes
+ * [@offset, @offset + @len) of the buffer. The begin and end of one CPU
+ * access should name the same range. Exporters without a range
+ * implementation sync the whole buffer, so the ioctl is always correct, only
+ * not always cheaper.
+ *
+ * The layout and number are those of the Android vendor kernels'
+ * DMA_BUF_IOCTL_SYNC_PARTIAL, so existing userspace works unchanged.
+ */
+struct dma_buf_sync_partial {
+	/** @flags: Set of access flags, as in &struct dma_buf_sync. */
+	__u64 flags;
+	/** @offset: Start of the range in bytes. */
+	__u32 offset;
+	/** @len: Length of the range in bytes; 0 is a no-op. */
+	__u32 len;
+};
+
 #define DMA_BUF_BASE		'b'
 #define DMA_BUF_IOCTL_SYNC	_IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
 
@@ -179,5 +200,7 @@ struct dma_buf_import_sync_file {
 #define DMA_BUF_SET_NAME_B	_IOW(DMA_BUF_BASE, 1, __u64)
 #define DMA_BUF_IOCTL_EXPORT_SYNC_FILE	_IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
 #define DMA_BUF_IOCTL_IMPORT_SYNC_FILE	_IOW(DMA_BUF_BASE, 3, struct dma_buf_import_sync_file)
+/* nr 2 again: the direction and size bits make it distinct from EXPORT_SYNC_FILE */
+#define DMA_BUF_IOCTL_SYNC_PARTIAL	_IOW(DMA_BUF_BASE, 2, struct dma_buf_sync_partial)
 
 #endif
