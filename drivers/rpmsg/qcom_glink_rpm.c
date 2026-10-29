@@ -339,8 +339,23 @@ static int glink_rpm_probe(struct platform_device *pdev)
 	rpm->tx_pipe.native.write = glink_rpm_tx_write;
 	rpm->tx_pipe.native.kick = glink_rpm_tx_kick;
 
-	writel(0, rpm->tx_pipe.head);
-	writel(0, rpm->rx_pipe.tail);
+	/*
+	 * The RPM is not restarted with us. After a kexec its FIFO indices still
+	 * hold the previous kernel's session: zeroing our end would make the RPM
+	 * parse stale TX bytes as new commands and make us re-read stale RX data.
+	 * Only the AP writes the TX FIFO, so a non-zero TX index means an earlier
+	 * session; then line our indices up with the RPM's instead.
+	 */
+	if (readl(rpm->tx_pipe.head) || readl(rpm->tx_pipe.tail)) {
+		dev_info(dev, "earlier session: tx %u/%u rx %u/%u (head/tail), resyncing\n",
+			 readl(rpm->tx_pipe.head), readl(rpm->tx_pipe.tail),
+			 readl(rpm->rx_pipe.head), readl(rpm->rx_pipe.tail));
+		writel(readl(rpm->tx_pipe.tail), rpm->tx_pipe.head);
+		writel(readl(rpm->rx_pipe.head), rpm->rx_pipe.tail);
+	} else {
+		writel(0, rpm->tx_pipe.head);
+		writel(0, rpm->rx_pipe.tail);
+	}
 
 	glink = qcom_glink_native_probe(dev,
 					0,
