@@ -47,11 +47,17 @@ static inline void update_wptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 	if (!ring)
 		return;
 
+	/*
+	 * Write the register under the lock (as a6xx does). Outside
+	 * it, a5xx_flush could write a newer wptr in between (the ABORT
+	 * path allows that), the CP could run past ours, and our older
+	 * value would land behind the CP's rptr: the CP then reads a whole
+	 * lap of stale ring (an old fence, freed IBs, CP opcode error).
+	 */
 	spin_lock_irqsave(&ring->preempt_lock, flags);
 	wptr = get_wptr(ring);
-	spin_unlock_irqrestore(&ring->preempt_lock, flags);
-
 	gpu_write(gpu, REG_A5XX_CP_RB_WPTR, wptr);
+	spin_unlock_irqrestore(&ring->preempt_lock, flags);
 }
 
 /* Return the highest priority ringbuffer with something in it */
