@@ -390,15 +390,15 @@
 
 	/*
 	 * Speaker amp: Awinic AW88194 (chip id 0x1806), fed from SEC_MI2S SD1.
-	 * Stock: aw881xx_smartpa@35, reset-gpio TLMM 94, no irq, no supply;
-	 * its tuning files come from the vendor partition (na1-ml-radio links
-	 * them to /lib/firmware/awinic).
+	 * Stock: aw881xx_smartpa@35, reset-gpio TLMM 94, no irq, no supply.
+	 * Its tuning files are the board's own (from its vendor partition):
+	 * the driver requests <firmware-name>_reg.bin, _fw.bin and _cfg.bin.
 	 */
 	speaker_amp: audio-codec@35 {
 		compatible = "awinic,aw88194";
 		reg = <0x35>;
 		reset-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
-		firmware-name = "awinic/aw881xx_na1_spk";
+		firmware-name = "qcom/sdm636/onyx/noteair/aw88194_spk";
 		#sound-dai-cells = <0>;
 	};
 };
