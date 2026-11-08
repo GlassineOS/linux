@@ -16,7 +16,7 @@ Branches:
 
 Build (arm64 cross compiler; GlassineOS uses ghcr.io/glassineos/kernel-build):
 
-  make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out sdm660_defconfig onyx-noteair.config
+  make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out sdm660_defconfig glassine.config onyx-noteair.config
   make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out Image.gz qcom/sdm636-onyx-noteair.dtb modules
 
 Commits made with AI assistance carry an Assisted-by: trailer. They are not

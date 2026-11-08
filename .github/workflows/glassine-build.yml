@@ -1,5 +1,5 @@
 # Build check for the GlassineOS branches: the Onyx Boox Note Air config
-# (sdm660_defconfig + onyx-noteair.config) compiles, with its device tree and
+# (sdm660_defconfig + glassine.config + onyx-noteair.config) compiles, with its device tree and
 # modules. Steps follow upstream's build-images.yml, on a GitHub-hosted arm64
 # runner (native build, no cross compiler). Not a release: what ships is
 # decided by the GlassineOS packages.
@@ -37,14 +37,14 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Configure (sdm660_defconfig + onyx-noteair.config)
+      - name: Configure (sdm660_defconfig + glassine.config + onyx-noteair.config)
         run: |
-          make O=.output sdm660_defconfig onyx-noteair.config
+          make O=.output sdm660_defconfig glassine.config onyx-noteair.config
           # every fragment option must have survived (a missing dependency drops it silently)
           missing=0
           while read -r l; do
             grep -qxF "$l" .output/.config || { echo "::error::fragment option not applied: $l"; missing=1; }
-          done < <(grep -hE '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' arch/arm64/configs/onyx-noteair.config)
+          done < <(grep -hE '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' kernel/configs/glassine.config arch/arm64/configs/onyx-noteair.config)
           exit $missing
 
       - name: Build Image.gz, the device tree and modules
