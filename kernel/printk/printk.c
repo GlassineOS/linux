@@ -2766,7 +2766,8 @@ MODULE_PARM_DESC(console_suspend, "suspend console during suspend"
 	" and hibernate operations");
 
 /*
- * Debug aid: keep the pstore console printing while the other consoles are
+ * Debug aid: keep the pstore console (named after its backend, ramoops)
+ * printing while the other consoles are
  * suspended, so a hang in a device's suspend or resume (or in a hibernation
  * restore) leaves its last messages in the persistent RAM region, which is
  * written uncached and survives a reset.
@@ -2814,7 +2815,7 @@ void console_suspend_all(void)
 
 	console_list_lock();
 	for_each_console(con) {
-		if (keep_pstore_console && !strcmp(con->name, "pstore"))
+		if (keep_pstore_console && !strcmp(con->name, "ramoops"))
 			continue;
 		console_srcu_write_flags(con, con->flags | CON_SUSPENDED);
 	}
