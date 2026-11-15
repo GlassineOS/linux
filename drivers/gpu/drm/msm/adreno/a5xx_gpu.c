@@ -805,8 +805,18 @@ static int a5xx_zap_shader_init(struct msm_gpu *gpu)
 	 * If the zap shader is already loaded into memory we just need to kick
 	 * the remote processor to reinitialize it
 	 */
-	if (loaded)
-		return a5xx_zap_shader_resume(gpu);
+	if (loaded) {
+		ret = a5xx_zap_shader_resume(gpu);
+		if (!ret)
+			return 0;
+
+		/*
+		 * After a restore from hibernation the secure world was
+		 * booted afresh and no longer holds the zap shader, so the
+		 * resume call fails. Load the shader again in that case.
+		 */
+		dev_warn(gpu->dev->dev, "zap shader lost, reloading it\n");
+	}
 
 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
 
