@@ -32,6 +32,8 @@ struct qcom_rmtfs_mem {
 	unsigned int client_id;
 
 	u64 perms;
+	struct qcom_scm_vmperm new_perms[NUM_MAX_VMIDS + 1];
+	int num_new_perms;
 };
 
 static ssize_t qcom_rmtfs_mem_show(struct device *dev,
@@ -276,6 +278,8 @@ static int qcom_rmtfs_mem_probe(struct platform_device *pdev)
 			dev_err(&pdev->dev, "assign memory failed\n");
 			goto remove_cdev;
 		}
+		memcpy(rmtfs_mem->new_perms, perms, sizeof(perms[0]) * (num_vmids + 1));
+		rmtfs_mem->num_new_perms = num_vmids + 1;
 	}
 
 	dev_set_drvdata(&pdev->dev, rmtfs_mem);
@@ -307,6 +311,36 @@ static void qcom_rmtfs_mem_remove(struct platform_device *pdev)
 	put_device(&rmtfs_mem->dev);
 }
 
+/*
+ * A restore from hibernation follows a cold boot: the secure world came back
+ * with the region owned by HLOS alone, while the restored state says it is
+ * shared with the remote. A remote started on it then faults on its own file
+ * system memory. Assign it again; a boot kernel that loaded this driver
+ * before the restore has done so already, which the secure world refuses.
+ */
+static int qcom_rmtfs_mem_restore(struct device *dev)
+{
+	struct qcom_rmtfs_mem *rmtfs_mem = dev_get_drvdata(dev);
+	u64 perms = BIT(QCOM_SCM_VMID_HLOS);
+	int ret;
+
+	if (!rmtfs_mem || !rmtfs_mem->num_new_perms)
+		return 0;
+
+	ret = qcom_scm_assign_mem(rmtfs_mem->addr, rmtfs_mem->size, &perms,
+				  rmtfs_mem->new_perms, rmtfs_mem->num_new_perms);
+	if (ret < 0)
+		dev_info(dev, "region not reassigned after restore (%d), keeping it\n", ret);
+	else
+		rmtfs_mem->perms = perms;
+
+	return 0;
+}
+
+static const struct dev_pm_ops qcom_rmtfs_mem_pm_ops = {
+	.restore = qcom_rmtfs_mem_restore,
+};
+
 static const struct of_device_id qcom_rmtfs_mem_of_match[] = {
 	{ .compatible = "qcom,rmtfs-mem" },
 	{}
@@ -319,6 +353,7 @@ static struct platform_driver qcom_rmtfs_mem_driver = {
 	.driver  = {
 		.name  = "qcom_rmtfs_mem",
 		.of_match_table = qcom_rmtfs_mem_of_match,
+		.pm = pm_sleep_ptr(&qcom_rmtfs_mem_pm_ops),
 	},
 };
 
