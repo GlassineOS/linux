@@ -95,6 +95,18 @@ static int ath10k_qmi_setup_msa_permissions(struct ath10k_qmi *qmi)
 
 	for (i = 0; i < qmi->nr_mem_region; i++) {
 		ret = ath10k_qmi_map_msa_permission(qmi, &qmi->mem_region[i]);
+		/*
+		 * Unbinding the driver releases the QMI handle before a
+		 * server exit can hand the MSA region back to HLOS, so the
+		 * next bind finds it still owned by the modem and WLAN.
+		 * Take it back and map it again.
+		 */
+		if (ret == -EINVAL) {
+			ath10k_warn(qmi->ar, "msa region %d still assigned, reclaiming it\n", i);
+			ret = ath10k_qmi_unmap_msa_permission(qmi, &qmi->mem_region[i]);
+			if (!ret)
+				ret = ath10k_qmi_map_msa_permission(qmi, &qmi->mem_region[i]);
+		}
 		if (ret)
 			goto err_unmap;
 	}
