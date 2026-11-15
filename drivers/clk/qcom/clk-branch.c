@@ -172,16 +172,30 @@ const struct clk_ops clk_branch2_mem_ops = {
 };
 EXPORT_SYMBOL_GPL(clk_branch2_mem_ops);
 
+/*
+ * After a restore from hibernation on a machine that was powered off, the
+ * branch is off in hardware while the clock framework still counts it as
+ * enabled: turn it on again, so that the next enable of a shared clock does
+ * not leave it off (see qcom_cc_hibernate_restore()).
+ */
+static void clk_branch2_restore_context(struct clk_hw *hw)
+{
+	if (__clk_get_enable_count(hw->clk))
+		clk_branch2_enable(hw);
+}
+
 const struct clk_ops clk_branch2_ops = {
 	.enable = clk_branch2_enable,
 	.disable = clk_branch2_disable,
 	.is_enabled = clk_is_enabled_regmap,
+	.restore_context = clk_branch2_restore_context,
 };
 EXPORT_SYMBOL_GPL(clk_branch2_ops);
 
 const struct clk_ops clk_branch2_aon_ops = {
 	.enable = clk_branch2_enable,
 	.is_enabled = clk_is_enabled_regmap,
+	.restore_context = clk_branch2_restore_context,
 };
 EXPORT_SYMBOL_GPL(clk_branch2_aon_ops);
 

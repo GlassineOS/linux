@@ -12,6 +12,8 @@
 #include <linux/pm_runtime.h>
 #include <linux/reset-controller.h>
 #include <linux/of.h>
+#include <linux/suspend.h>
+#include <linux/syscore_ops.h>
 
 #include "common.h"
 #include "clk-alpha-pll.h"
@@ -463,6 +465,73 @@ int qcom_cc_probe_by_index(struct platform_device *pdev, int index,
 	return qcom_cc_really_probe(&pdev->dev, desc, regmap);
 }
 EXPORT_SYMBOL_GPL(qcom_cc_probe_by_index);
+
+/*
+ * Hibernation: a restore on a machine that was powered off in between finds
+ * the clock controllers in the state the boot that loaded the image left them
+ * in, while the clock framework and the power domains of the restored kernel
+ * still count what was on when the image was taken. A shared clock (a bus
+ * clock of several devices) then stays off in hardware for good, and the
+ * first register access of a device behind it stalls the bus. Save the RCG
+ * configuration of the clocks in use when the image is taken (syscore
+ * suspend, last before the snapshot) and write the in-use state back on the
+ * syscore resume that follows, before any device's restore callback: power
+ * domains first, then RCGs and branches from the roots down. Only between
+ * PM_HIBERNATION_PREPARE and its end; a suspend to RAM never takes this path.
+ */
+static bool qcom_cc_hibernating;
+
+static int qcom_cc_hibernate_notify(struct notifier_block *nb,
+				    unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_HIBERNATION_PREPARE:
+		qcom_cc_hibernating = true;
+		break;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		qcom_cc_hibernating = false;
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block qcom_cc_hibernate_nb = {
+	.notifier_call = qcom_cc_hibernate_notify,
+};
+
+static int qcom_cc_hibernate_save(void *data)
+{
+	if (qcom_cc_hibernating)
+		clk_save_context();
+	return 0;
+}
+
+static void qcom_cc_hibernate_restore(void *data)
+{
+	if (!qcom_cc_hibernating)
+		return;
+	gdsc_hibernate_restore();
+	clk_restore_context();
+}
+
+static const struct syscore_ops qcom_cc_hibernate_ops = {
+	.suspend = qcom_cc_hibernate_save,
+	.resume = qcom_cc_hibernate_restore,
+};
+
+static struct syscore qcom_cc_hibernate_syscore = {
+	.ops = &qcom_cc_hibernate_ops,
+};
+
+static int __init qcom_cc_hibernate_init(void)
+{
+	if (!IS_ENABLED(CONFIG_HIBERNATION))
+		return 0;
+	register_syscore(&qcom_cc_hibernate_syscore);
+	return register_pm_notifier(&qcom_cc_hibernate_nb);
+}
+subsys_initcall(qcom_cc_hibernate_init);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("QTI Common Clock module");
