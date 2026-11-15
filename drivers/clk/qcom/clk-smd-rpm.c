@@ -18,6 +18,8 @@
 
 #include <dt-bindings/clock/qcom,rpmcc.h>
 
+#include "common.h"
+
 #define __DEFINE_CLK_SMD_RPM_PREFIX(_prefix, _name, _active,		      \
 				    type, r_id, key, ao_rate, ao_flags)			      \
 	static struct clk_smd_rpm clk_smd_rpm_##_prefix##_active;	      \
@@ -1459,10 +1461,21 @@ err:
 	return ret;
 }
 
+static int rpm_smd_clk_restore(struct device *dev)
+{
+	qcom_cc_hibernate_restore_late();
+	return 0;
+}
+
+static const struct dev_pm_ops rpm_smd_clk_pm_ops = {
+	.restore_early = rpm_smd_clk_restore,
+};
+
 static struct platform_driver rpm_smd_clk_driver = {
 	.driver = {
 		.name = "qcom-clk-smd-rpm",
 		.of_match_table = rpm_smd_clk_match_table,
+		.pm = pm_sleep_ptr(&rpm_smd_clk_pm_ops),
 	},
 	.probe = rpm_smd_clk_probe,
 };
