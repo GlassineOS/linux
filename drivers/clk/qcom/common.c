@@ -516,6 +516,18 @@ static void qcom_cc_hibernate_restore(void *data)
 	clk_restore_context();
 }
 
+/*
+ * The second pass, from the RPM clock controller's restore_early, once the
+ * RPM has the restored kernel's requests again: a clock behind a bus that only
+ * an RPM vote powers (the multimedia controller's) stays off in the first.
+ */
+void qcom_cc_hibernate_restore_late(void)
+{
+	if (qcom_cc_hibernating)
+		qcom_cc_hibernate_restore(NULL);
+}
+EXPORT_SYMBOL_GPL(qcom_cc_hibernate_restore_late);
+
 static const struct syscore_ops qcom_cc_hibernate_ops = {
 	.suspend = qcom_cc_hibernate_save,
 	.resume = qcom_cc_hibernate_restore,

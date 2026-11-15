@@ -11,6 +11,8 @@
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 
+#include <linux/list.h>
+#include <linux/pm.h>
 #include <linux/rpmsg.h>
 #include <linux/soc/qcom/smd-rpm.h>
 
@@ -31,6 +33,24 @@ struct qcom_smd_rpm {
 	struct completion ack;
 	struct mutex lock;
 	int ack_status;
+
+	struct list_head cache;
+};
+
+/*
+ * The last value of every request the RPM accepted, per set, resource and
+ * key, for qcom_smd_rpm_restore(): after a restore from hibernation on a
+ * machine that was powered off, the RPM holds the requests of the boot that
+ * loaded the image, not those of the restored kernel.
+ */
+struct qcom_rpm_cached {
+	struct list_head node;
+	int state;
+	u32 type;
+	u32 id;
+	u32 key;
+	size_t count;
+	u8 buf[];
 };
 
 /**
@@ -91,11 +111,8 @@ struct qcom_rpm_message {
  * @buf:	the data to be written
  * @count:	number of bytes in @buf
  */
-int qcom_rpm_smd_write(struct qcom_smd_rpm *rpm,
-		       int state,
-		       u32 type, u32 id,
-		       void *buf,
-		       size_t count)
+static int qcom_rpm_smd_send(struct qcom_smd_rpm *rpm, int state, u32 type,
+			     u32 id, const void *buf, size_t count)
 {
 	static unsigned msg_id = 1;
 	int left;
@@ -114,8 +131,6 @@ int qcom_rpm_smd_write(struct qcom_smd_rpm *rpm,
 	pkt = kmalloc(size, GFP_ATOMIC);
 	if (!pkt)
 		return -ENOMEM;
-
-	mutex_lock(&rpm->lock);
 
 	pkt->hdr.service_type = cpu_to_le32(RPM_SERVICE_TYPE_REQUEST);
 	pkt->hdr.length = cpu_to_le32(sizeof(struct qcom_rpm_request) + count);
@@ -139,10 +154,85 @@ int qcom_rpm_smd_write(struct qcom_smd_rpm *rpm,
 
 out:
 	kfree(pkt);
+	return ret;
+}
+
+static void qcom_rpm_smd_cache(struct qcom_smd_rpm *rpm, int state, u32 type,
+			       u32 id, const void *buf, size_t count)
+{
+	struct qcom_rpm_cached *c, *n;
+	u32 key = 0;
+
+	if (count >= sizeof(key))
+		memcpy(&key, buf, sizeof(key));
+
+	list_for_each_entry(c, &rpm->cache, node) {
+		if (c->state != state || c->type != type || c->id != id || c->key != key)
+			continue;
+		if (c->count == count) {
+			memcpy(c->buf, buf, count);
+			return;
+		}
+		list_del(&c->node);
+		kfree(c);
+		break;
+	}
+
+	n = kmalloc(struct_size(n, buf, count), GFP_KERNEL);
+	if (!n)
+		return;
+	n->state = state;
+	n->type = type;
+	n->id = id;
+	n->key = key;
+	n->count = count;
+	memcpy(n->buf, buf, count);
+	list_add_tail(&n->node, &rpm->cache);
+}
+
+int qcom_rpm_smd_write(struct qcom_smd_rpm *rpm,
+		       int state,
+		       u32 type, u32 id,
+		       void *buf,
+		       size_t count)
+{
+	int ret;
+
+	mutex_lock(&rpm->lock);
+	ret = qcom_rpm_smd_send(rpm, state, type, id, buf, count);
+	if (!ret)
+		qcom_rpm_smd_cache(rpm, state, type, id, buf, count);
 	mutex_unlock(&rpm->lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(qcom_rpm_smd_write);
+
+/*
+ * Send every cached request again. Runs in the restore_early phase, before
+ * the RPM's children (clocks, regulators, buses) and the devices that use
+ * them are restored; only after a restore from a hibernation image.
+ */
+static int qcom_smd_rpm_restore(struct device *dev)
+{
+	struct qcom_smd_rpm *rpm = dev_get_drvdata(dev);
+	struct qcom_rpm_cached *c;
+	int n = 0, failed = 0;
+
+	mutex_lock(&rpm->lock);
+	list_for_each_entry(c, &rpm->cache, node) {
+		if (qcom_rpm_smd_send(rpm, c->state, c->type, c->id, c->buf, c->count))
+			failed++;
+		n++;
+	}
+	mutex_unlock(&rpm->lock);
+
+	dev_info(dev, "sent %d requests again after the restore (%d failed)\n", n, failed);
+	return 0;
+}
+
+static const struct dev_pm_ops qcom_smd_rpm_pm_ops = {
+	.restore_early = qcom_smd_rpm_restore,
+};
 
 static int qcom_smd_rpm_callback(struct rpmsg_device *rpdev,
 				 void *data,
@@ -202,6 +292,7 @@ static int qcom_smd_rpm_probe(struct rpmsg_device *rpdev)
 
 	mutex_init(&rpm->lock);
 	init_completion(&rpm->ack);
+	INIT_LIST_HEAD(&rpm->cache);
 
 	rpm->dev = &rpdev->dev;
 	rpm->rpm_channel = rpdev->ept;
@@ -252,6 +343,7 @@ static struct rpmsg_driver qcom_smd_rpm_driver = {
 	.drv  = {
 		.name  = "qcom_smd_rpm",
 		.of_match_table = qcom_smd_rpm_of_match,
+		.pm = pm_sleep_ptr(&qcom_smd_rpm_pm_ops),
 	},
 };
 
