@@ -273,15 +273,16 @@ EXPORT_SYMBOL_GPL(qcom_q6v5_panic);
  * @q6v5:	reference to qcom_q6v5 context
  *
  * Called from the restore callback once a hibernation image is loaded. If the
- * remote processor was running when the image was taken but no longer signals
- * ready, the machine went through a full boot in between and the remote
- * processor, together with its state in the secure world, was reset. Mark it
- * as lost, so that the following stop skips the stop handshake and everything
- * that talks to the remote's hardware or secure-world state, and let the
- * recovery work, which runs once the system has been thawed, start it again.
+ * remote processor was running when the image was taken but its smp2p item is
+ * gone from SMEM, the machine went through a full boot in between and the
+ * remote processor, together with its state in the secure world, was reset.
+ * Mark it as lost, so that the following stop skips the stop handshake and
+ * everything that talks to the remote's hardware or secure-world state, and
+ * let the recovery work, which runs once the system has been thawed, start it
+ * again.
  *
- * A remote processor that still signals ready is left alone, as after a
- * hibernation that did not power the machine off.
+ * Any other remote processor is left alone, as after a hibernation that did
+ * not power the machine off.
  */
 void qcom_q6v5_restore(struct qcom_q6v5 *q6v5)
 {
@@ -291,11 +292,23 @@ void qcom_q6v5_restore(struct qcom_q6v5 *q6v5)
 	if (!q6v5->running || q6v5->rproc->state != RPROC_RUNNING)
 		return;
 
-	/* -ENODEV: the remote has not even allocated its smp2p entry */
+	/*
+	 * smp2p's own restore callback, which runs first (the remote's device
+	 * is linked to it as a consumer of its interrupts), drops the entries
+	 * of a remote whose item is gone from SMEM: -ENODEV then means that
+	 * the remote has not run since the machine booted. Anything else, even
+	 * a ready line that reads low, leaves the remote alone: restarting a
+	 * remote that does run would load firmware over it.
+	 */
 	ret = irq_get_irqchip_state(q6v5->ready_irq, IRQCHIP_STATE_LINE_LEVEL,
 				    &ready);
-	if (ret != -ENODEV && (ret || ready)) {
-		dev_info(q6v5->dev, "still running after restore\n");
+	if (ret != -ENODEV) {
+		if (ret)
+			dev_info(q6v5->dev, "state unknown after restore (%d), leaving it\n",
+				 ret);
+		else
+			dev_info(q6v5->dev, "%s after restore, leaving it\n",
+				 ready ? "still running" : "not ready");
 		return;
 	}
 
