@@ -96,6 +96,7 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
 	reinit_completion(&q6v5->stop_done);
 
 	q6v5->running = true;
+	q6v5->lost_power = false;
 	q6v5->handover_issued = false;
 
 	q6v5_handover_irq_enable(q6v5);
@@ -266,6 +267,58 @@ unsigned long qcom_q6v5_panic(struct qcom_q6v5 *q6v5)
 	return Q6V5_PANIC_DELAY_MS;
 }
 EXPORT_SYMBOL_GPL(qcom_q6v5_panic);
+
+/**
+ * qcom_q6v5_restore() - restart a remote processor that lost power
+ * @q6v5:	reference to qcom_q6v5 context
+ *
+ * Called from the restore callback once a hibernation image is loaded. If the
+ * remote processor was running when the image was taken but its smp2p item is
+ * gone from SMEM, the machine went through a full boot in between and the
+ * remote processor, together with its state in the secure world, was reset.
+ * Mark it as lost, so that the following stop skips the stop handshake and
+ * everything that talks to the remote's hardware or secure-world state, and
+ * let the recovery work, which runs once the system has been thawed, start it
+ * again.
+ *
+ * Any other remote processor is left alone, as after a hibernation that did
+ * not power the machine off.
+ */
+void qcom_q6v5_restore(struct qcom_q6v5 *q6v5)
+{
+	bool ready;
+	int ret;
+
+	if (!q6v5->running || q6v5->rproc->state != RPROC_RUNNING)
+		return;
+
+	/*
+	 * smp2p's own restore callback, which runs first (the remote's device
+	 * is linked to it as a consumer of its interrupts), drops the entries
+	 * of a remote whose item is gone from SMEM: -ENODEV then means that
+	 * the remote has not run since the machine booted. Anything else, even
+	 * a ready line that reads low, leaves the remote alone: restarting a
+	 * remote that does run would load firmware over it.
+	 */
+	ret = irq_get_irqchip_state(q6v5->ready_irq, IRQCHIP_STATE_LINE_LEVEL,
+				    &ready);
+	if (ret != -ENODEV) {
+		if (ret)
+			dev_info(q6v5->dev, "state unknown after restore (%d), leaving it\n",
+				 ret);
+		else
+			dev_info(q6v5->dev, "%s after restore, leaving it\n",
+				 ready ? "still running" : "not ready");
+		return;
+	}
+
+	dev_info(q6v5->dev, "lost power across restore, restarting it\n");
+
+	q6v5->running = false;
+	q6v5->lost_power = true;
+	rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
+}
+EXPORT_SYMBOL_GPL(qcom_q6v5_restore);
 
 /**
  * qcom_q6v5_init() - initializer of the q6v5 common struct
