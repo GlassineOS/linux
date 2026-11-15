@@ -637,6 +637,7 @@ static int __clk_rcg2_set_rate(struct clk_hw *hw, unsigned long rate,
 	if (!f)
 		return -EINVAL;
 
+	rcg->ctx_stale = false;
 	return clk_rcg2_configure(rcg, f);
 }
 
@@ -831,7 +832,16 @@ static void clk_rcg2_restore_context(struct clk_hw *hw)
 	struct regmap *map = rcg->clkr.regmap;
 	u32 cfg;
 
-	if (!rcg->ctx_saved || !__clk_get_enable_count(hw->clk))
+	/*
+	 * Not in use: its configuration was not saved and is now whatever the
+	 * boot left, while the framework still has the old rate (and skips a
+	 * set_rate to it). Program that rate on the next enable.
+	 */
+	if (!rcg->ctx_saved) {
+		rcg->ctx_stale = true;
+		return;
+	}
+	if (!__clk_get_enable_count(hw->clk))
 		return;
 
 	if (regmap_read(map, RCG_CFG_OFFSET(rcg), &cfg) || cfg == rcg->ctx_cfg)
@@ -850,7 +860,37 @@ static void clk_rcg2_restore_context(struct clk_hw *hw)
 	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, 0);
 }
 
+/*
+ * The first enable of an RCG left stale by a restore: the rate the framework
+ * believes it runs at, written to the hardware.
+ */
+static int clk_rcg2_enable(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+	const struct freq_tbl *f;
+	u32 cfg;
+
+	if (likely(!rcg->ctx_stale))
+		return 0;
+	rcg->ctx_stale = false;
+
+	f = rcg->freq_tbl ? qcom_find_freq(rcg->freq_tbl, clk_hw_get_rate(hw)) : NULL;
+	if (!f || regmap_read(map, RCG_CFG_OFFSET(rcg), &cfg) ||
+	    __clk_rcg2_configure(rcg, f, &cfg))
+		return 0;
+
+	regmap_write(map, RCG_CFG_OFFSET(rcg), cfg);
+	/* the update takes effect only on a running root */
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, CMD_ROOT_EN);
+	if (update_config(rcg))
+		pr_warn("%s: rate not restored\n", clk_hw_get_name(hw));
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, 0);
+	return 0;
+}
+
 const struct clk_ops clk_rcg2_ops = {
+	.enable = clk_rcg2_enable,
 	.save_context = clk_rcg2_save_context,
 	.restore_context = clk_rcg2_restore_context,
 	.is_enabled = clk_rcg2_is_enabled,
