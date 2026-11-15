@@ -152,6 +152,10 @@ static void qcom_pas_minidump(struct rproc *rproc)
 	if (rproc->dump_conf == RPROC_COREDUMP_DISABLED)
 		return;
 
+	/* Nothing to dump from a remote that was reset with the machine */
+	if (pas->q6v5.lost_power)
+		return;
+
 	pas->mem_region = qcom_pas_ctx_map(pas->pas_ctx);
 	if (!pas->mem_region)
 		return;
@@ -413,15 +417,24 @@ static int qcom_pas_stop(struct rproc *rproc)
 	if (ret == -ETIMEDOUT)
 		dev_err(pas->dev, "timed out on wait\n");
 
-	ret = qcom_pas_shutdown(pas->pas_id);
-	if (ret && pas->decrypt_shutdown)
-		ret = qcom_pas_shutdown_poll_decrypt(pas);
+	/*
+	 * A remote that lost power across a restore from hibernation has no
+	 * image in the secure world any more; there is nothing to shut down.
+	 */
+	if (pas->q6v5.lost_power) {
+		ret = 0;
+	} else {
+		ret = qcom_pas_shutdown(pas->pas_id);
+		if (ret && pas->decrypt_shutdown)
+			ret = qcom_pas_shutdown_poll_decrypt(pas);
+	}
 
 	if (ret)
 		dev_err(pas->dev, "failed to shutdown: %d\n", ret);
 
 	if (pas->dtb_pas_id) {
-		dtb_ret = qcom_pas_shutdown(pas->dtb_pas_id);
+		dtb_ret = pas->q6v5.lost_power ? 0 :
+			  qcom_pas_shutdown(pas->dtb_pas_id);
 		if (dtb_ret)
 			dev_err(pas->dev, "failed to shutdown dtb: %d\n", dtb_ret);
 
@@ -582,6 +595,10 @@ disable_running:
 static void qcom_pas_coredump(struct rproc *rproc)
 {
 	struct qcom_pas *pas = rproc->priv;
+
+	/* Nothing to dump from a remote that was reset with the machine */
+	if (pas->q6v5.lost_power)
+		return;
 
 	pas->mem_region = qcom_pas_ctx_map(pas->pas_ctx);
 	if (!pas->mem_region)
@@ -1916,12 +1933,26 @@ static const struct of_device_id qcom_pas_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, qcom_pas_of_match);
 
+static int qcom_pas_restore(struct device *dev)
+{
+	struct qcom_pas *pas = dev_get_drvdata(dev);
+
+	qcom_q6v5_restore(&pas->q6v5);
+
+	return 0;
+}
+
+static const struct dev_pm_ops qcom_pas_pm_ops = {
+	.restore = qcom_pas_restore,
+};
+
 static struct platform_driver qcom_pas_driver = {
 	.probe = qcom_pas_probe,
 	.remove = qcom_pas_remove,
 	.driver = {
 		.name = "qcom_q6v5_pas",
 		.of_match_table = qcom_pas_of_match,
+		.pm = pm_sleep_ptr(&qcom_pas_pm_ops),
 	},
 };
 

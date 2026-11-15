@@ -1339,6 +1339,18 @@ static void q6v5_mba_reclaim(struct q6v5 *qproc)
 	qproc->dump_mba_loaded = false;
 	qproc->dp_size = 0;
 
+	/*
+	 * A modem that lost power across a restore from hibernation was reset
+	 * with the machine: its AXI ports are not in use and must not be asked
+	 * to halt, and the secure world handed all memory back to us when it
+	 * was reset. Only drop the votes we still hold.
+	 */
+	if (qproc->q6v5.lost_power) {
+		qproc->mpss_perm = BIT(QCOM_SCM_VMID_HLOS);
+		qproc->mba_perm = BIT(QCOM_SCM_VMID_HLOS);
+		goto reset;
+	}
+
 	q6v5proc_halt_axi_port(qproc, qproc->halt_map, qproc->halt_q6);
 	if (qproc->has_vq6)
 		q6v5proc_halt_axi_port(qproc, qproc->halt_map, qproc->halt_vq6);
@@ -1372,6 +1384,7 @@ static void q6v5_mba_reclaim(struct q6v5 *qproc)
 	q6v5proc_disable_qchannel(qproc, qproc->halt_map, qproc->qaccept_cx);
 	q6v5proc_disable_qchannel(qproc, qproc->halt_map, qproc->qaccept_axi);
 
+reset:
 	q6v5_reset_assert(qproc);
 
 	q6v5_clk_disable(qproc->dev, qproc->reset_clks,
@@ -1778,12 +1791,27 @@ static unsigned long q6v5_panic(struct rproc *rproc)
 	return qcom_q6v5_panic(&qproc->q6v5);
 }
 
+static void q6v5_coredump(struct rproc *rproc)
+{
+	struct q6v5 *qproc = rproc->priv;
+
+	/*
+	 * Dumping reloads the MBA; there is nothing to dump from a modem that
+	 * was reset with the machine.
+	 */
+	if (qproc->q6v5.lost_power)
+		return;
+
+	rproc_coredump(rproc);
+}
+
 static const struct rproc_ops q6v5_ops = {
 	.start = q6v5_start,
 	.stop = q6v5_stop,
 	.parse_fw = qcom_q6v5_register_dump_segments,
 	.load = q6v5_load,
 	.panic = q6v5_panic,
+	.coredump = q6v5_coredump,
 };
 
 static void qcom_msa_handover(struct qcom_q6v5 *q6v5)
@@ -2923,12 +2951,26 @@ static const struct of_device_id q6v5_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, q6v5_of_match);
 
+static int q6v5_restore(struct device *dev)
+{
+	struct q6v5 *qproc = dev_get_drvdata(dev);
+
+	qcom_q6v5_restore(&qproc->q6v5);
+
+	return 0;
+}
+
+static const struct dev_pm_ops q6v5_pm_ops = {
+	.restore = q6v5_restore,
+};
+
 static struct platform_driver q6v5_driver = {
 	.probe = q6v5_probe,
 	.remove = q6v5_remove,
 	.driver = {
 		.name = "qcom-q6v5-mss",
 		.of_match_table = q6v5_of_match,
+		.pm = pm_sleep_ptr(&q6v5_pm_ops),
 	},
 };
 module_platform_driver(q6v5_driver);
