@@ -130,6 +130,7 @@ struct smp2p_entry {
  * @negotiation_done: whether negotiating finished
  * @local_pid:	processor id of the inbound edge
  * @remote_pid:	processor id of the outbound edge
+ * @irq:	interrupt raised by the remote processor
  * @ipc_regmap:	regmap for the outbound ipc
  * @ipc_offset:	offset within the regmap
  * @ipc_bit:	bit in regmap@offset to kick to signal remote processor
@@ -154,6 +155,7 @@ struct qcom_smp2p {
 
 	unsigned local_pid;
 	unsigned remote_pid;
+	int irq;
 
 	struct regmap *ipc_regmap;
 	int ipc_offset;
@@ -516,9 +518,8 @@ static const struct qcom_smem_state_ops smp2p_state_ops = {
 	.update_bits = smp2p_update_bits,
 };
 
-static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
-				     struct smp2p_entry *entry,
-				     struct device_node *node)
+static void qcom_smp2p_add_outbound_entry(struct qcom_smp2p *smp2p,
+					  struct smp2p_entry *entry)
 {
 	struct smp2p_smem_item *out = smp2p->out;
 	char buf[SMP2P_MAX_ENTRY_NAME] = {};
@@ -531,6 +532,13 @@ static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
 	entry->value = &out->entries[out->valid_entries].value;
 
 	out->valid_entries++;
+}
+
+static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
+				     struct smp2p_entry *entry,
+				     struct device_node *node)
+{
+	qcom_smp2p_add_outbound_entry(smp2p, entry);
 
 	entry->state = qcom_smem_state_register(node, &smp2p_state_ops, entry);
 	if (IS_ERR(entry->state)) {
@@ -662,6 +670,7 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	smp2p->irq = irq;
 
 	smp2p->mbox_client.dev = &pdev->dev;
 	smp2p->mbox_client.knows_txdone = true;
@@ -782,6 +791,73 @@ static void qcom_smp2p_remove(struct platform_device *pdev)
 	smp2p->out->valid_entries = 0;
 }
 
+/*
+ * SMEM is not part of a hibernation image. After a restore it holds what the
+ * firmware and the boot kernel of the boot that loaded the image put there:
+ * the remote processors were reset and have not allocated their items, and our
+ * own outbound item is the one the boot kernel allocated. Point the driver at
+ * the items that exist now, so that a remote processor that is started again
+ * is seen from its first state change. Nothing changes when both items are
+ * still where they were, as after a hibernation that did not power off.
+ */
+static int qcom_smp2p_restore(struct device *dev)
+{
+	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
+	unsigned int pid = smp2p->remote_pid;
+	struct smp2p_smem_item *item;
+	struct smp2p_entry *entry;
+	bool changed = false;
+	int ret = 0;
+
+	disable_irq(smp2p->irq);
+
+	item = qcom_smem_get(pid, smp2p->smem_items[SMP2P_OUTBOUND], NULL);
+	if (item != smp2p->out) {
+		dev_warn(dev, "outbound item moved across restore, recreating it\n");
+
+		ret = qcom_smp2p_alloc_outbound_item(smp2p);
+		if (ret)
+			goto out;
+
+		/* Same order as at probe, which list_add() reversed */
+		list_for_each_entry_reverse(entry, &smp2p->outbound, node)
+			qcom_smp2p_add_outbound_entry(smp2p, entry);
+		changed = true;
+	}
+
+	item = qcom_smem_get(pid, smp2p->smem_items[SMP2P_INBOUND], NULL);
+	if (smp2p->in && item != smp2p->in) {
+		dev_info(dev, "remote processor was reset, waiting for its item\n");
+
+		smp2p->in = NULL;
+		smp2p->valid_entries = 0;
+		smp2p->negotiation_done = false;
+		smp2p->ssr_ack_enabled = false;
+		smp2p->ssr_ack = false;
+		smp2p->out->flags &= ~BIT(SMP2P_FLAGS_RESTART_ACK_BIT);
+
+		list_for_each_entry(entry, &smp2p->inbound, node) {
+			entry->value = NULL;
+			entry->last_value = 0;
+		}
+
+		/* The remote processor may already be up again */
+		qcom_smp2p_start_in(smp2p);
+		changed = true;
+	}
+
+	if (changed)
+		qcom_smp2p_kick(smp2p);
+out:
+	enable_irq(smp2p->irq);
+
+	return ret;
+}
+
+static const struct dev_pm_ops qcom_smp2p_pm_ops = {
+	.restore = qcom_smp2p_restore,
+};
+
 static const struct of_device_id qcom_smp2p_of_match[] = {
 	{ .compatible = "qcom,smp2p" },
 	{}
@@ -794,6 +870,7 @@ static struct platform_driver qcom_smp2p_driver = {
 	.driver  = {
 		.name  = "qcom_smp2p",
 		.of_match_table = qcom_smp2p_of_match,
+		.pm = pm_sleep_ptr(&qcom_smp2p_pm_ops),
 	},
 };
 module_platform_driver(qcom_smp2p_driver);
