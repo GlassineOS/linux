@@ -176,6 +176,7 @@ struct clk_rcg2 {
 	u32			parked_cfg;
 	bool			hw_clk_ctrl;
 	bool			ctx_saved;
+	bool			ctx_stale;
 	u32			ctx_cfg;
 	u32			ctx_m;
 	u32			ctx_n;
