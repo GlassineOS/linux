@@ -812,6 +812,12 @@ static int qcom_smp2p_restore(struct device *dev)
 	disable_irq(smp2p->irq);
 
 	item = qcom_smem_get(pid, smp2p->smem_items[SMP2P_OUTBOUND], NULL);
+	if (IS_ERR(item) && PTR_ERR(item) != -ENOENT) {
+		/* SMEM could not be read: nothing is known, change nothing */
+		dev_warn(dev, "outbound item unreadable after restore (%ld), leaving it\n",
+			 PTR_ERR(item));
+		goto out;
+	}
 	if (item != smp2p->out) {
 		dev_warn(dev, "outbound item moved across restore, recreating it\n");
 
@@ -826,8 +832,14 @@ static int qcom_smp2p_restore(struct device *dev)
 	}
 
 	item = qcom_smem_get(pid, smp2p->smem_items[SMP2P_INBOUND], NULL);
+	if (IS_ERR(item) && PTR_ERR(item) != -ENOENT) {
+		dev_warn(dev, "inbound item unreadable after restore (%ld), leaving it\n",
+			 PTR_ERR(item));
+		goto kick;
+	}
 	if (smp2p->in && item != smp2p->in) {
-		dev_info(dev, "remote processor was reset, waiting for its item\n");
+		dev_info(dev, "remote processor was reset, waiting for its item (%s)\n",
+			 IS_ERR(item) ? "item gone" : "item moved");
 
 		smp2p->in = NULL;
 		smp2p->valid_entries = 0;
@@ -846,6 +858,7 @@ static int qcom_smp2p_restore(struct device *dev)
 		changed = true;
 	}
 
+kick:
 	if (changed)
 		qcom_smp2p_kick(smp2p);
 out:

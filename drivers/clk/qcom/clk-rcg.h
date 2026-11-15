@@ -175,6 +175,12 @@ struct clk_rcg2 {
 	u8			cfg_off;
 	u32			parked_cfg;
 	bool			hw_clk_ctrl;
+	bool			ctx_saved;
+	bool			ctx_stale;
+	u32			ctx_cfg;
+	u32			ctx_m;
+	u32			ctx_n;
+	u32			ctx_d;
 };
 
 #define to_clk_rcg2(_hw) container_of(to_clk_regmap(_hw), struct clk_rcg2, clkr)

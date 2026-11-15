@@ -637,6 +637,7 @@ static int __clk_rcg2_set_rate(struct clk_hw *hw, unsigned long rate,
 	if (!f)
 		return -EINVAL;
 
+	rcg->ctx_stale = false;
 	return clk_rcg2_configure(rcg, f);
 }
 
@@ -798,7 +799,100 @@ static int clk_rcg2_set_duty_cycle(struct clk_hw *hw, struct clk_duty *duty)
 	return update_config(rcg);
 }
 
+/*
+ * Hibernation: the configuration of an RCG that is in use when the image is
+ * taken, written back after a restore on a machine that was powered off in
+ * between (the RCG then holds its reset or boot configuration). RCGs that are
+ * not in use are not touched: their controller may not be accessible.
+ */
+static int clk_rcg2_save_context(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+
+	rcg->ctx_saved = false;
+	if (!__clk_get_enable_count(hw->clk))
+		return 0;
+
+	if (regmap_read(map, RCG_CFG_OFFSET(rcg), &rcg->ctx_cfg))
+		return 0;
+	if (rcg->mnd_width &&
+	    (regmap_read(map, RCG_M_OFFSET(rcg), &rcg->ctx_m) ||
+	     regmap_read(map, RCG_N_OFFSET(rcg), &rcg->ctx_n) ||
+	     regmap_read(map, RCG_D_OFFSET(rcg), &rcg->ctx_d)))
+		return 0;
+
+	rcg->ctx_saved = true;
+	return 0;
+}
+
+static void clk_rcg2_restore_context(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+	u32 cfg;
+
+	/*
+	 * Not in use: its configuration was not saved and is now whatever the
+	 * boot left, while the framework still has the old rate (and skips a
+	 * set_rate to it). Program that rate on the next enable.
+	 */
+	if (!rcg->ctx_saved) {
+		rcg->ctx_stale = true;
+		return;
+	}
+	if (!__clk_get_enable_count(hw->clk))
+		return;
+
+	if (regmap_read(map, RCG_CFG_OFFSET(rcg), &cfg) || cfg == rcg->ctx_cfg)
+		return;
+
+	if (rcg->mnd_width) {
+		regmap_write(map, RCG_M_OFFSET(rcg), rcg->ctx_m);
+		regmap_write(map, RCG_N_OFFSET(rcg), rcg->ctx_n);
+		regmap_write(map, RCG_D_OFFSET(rcg), rcg->ctx_d);
+	}
+	regmap_write(map, RCG_CFG_OFFSET(rcg), rcg->ctx_cfg);
+	/* the update takes effect only on a running root */
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, CMD_ROOT_EN);
+	if (update_config(rcg))
+		pr_warn("%s: configuration not restored\n", clk_hw_get_name(hw));
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, 0);
+}
+
+/*
+ * The first enable of an RCG left stale by a restore: the rate the framework
+ * believes it runs at, written to the hardware.
+ */
+static int clk_rcg2_enable(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+	const struct freq_tbl *f;
+	u32 cfg;
+
+	if (likely(!rcg->ctx_stale))
+		return 0;
+	rcg->ctx_stale = false;
+
+	f = rcg->freq_tbl ? qcom_find_freq(rcg->freq_tbl, clk_hw_get_rate(hw)) : NULL;
+	if (!f || regmap_read(map, RCG_CFG_OFFSET(rcg), &cfg) ||
+	    __clk_rcg2_configure(rcg, f, &cfg))
+		return 0;
+
+	regmap_write(map, RCG_CFG_OFFSET(rcg), cfg);
+	/* the update takes effect only on a running root */
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, CMD_ROOT_EN);
+	if (update_config(rcg))
+		pr_warn("%s: rate not restored\n", clk_hw_get_name(hw));
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, 0);
+	return 0;
+}
+
 const struct clk_ops clk_rcg2_ops = {
+	.enable = clk_rcg2_enable,
+	.save_context = clk_rcg2_save_context,
+	.restore_context = clk_rcg2_restore_context,
 	.is_enabled = clk_rcg2_is_enabled,
 	.get_parent = clk_rcg2_get_parent,
 	.set_parent = clk_rcg2_set_parent,

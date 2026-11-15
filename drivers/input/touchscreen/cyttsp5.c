@@ -116,6 +116,7 @@ module_param(palm_debug, bool, 0644);
 #define CY_HID_OUTPUT_TIMEOUT_MS		200
 #define CY_HID_OUTPUT_GET_SYSINFO_TIMEOUT_MS	3000
 #define CY_HID_GET_HID_DESCRIPTOR_TIMEOUT_MS	4000
+#define CY_STARTUP_ATTEMPTS			3
 #define CY_HID_SET_POWER_TIMEOUT		500
 
 /* maximum number of concurrent tracks */
@@ -768,6 +769,12 @@ static int cyttsp5_get_hid_descriptor(struct cyttsp5 *ts,
 	struct device *dev = ts->dev;
 	int rc;
 
+	/*
+	 * A completion left by an earlier frame (the launch-app answer, an
+	 * empty report) would hand back that frame as the descriptor.
+	 */
+	reinit_completion(&ts->cmd_done);
+
 	rc = cyttsp5_write(ts, HID_DESC_REG, NULL, 0);
 	if (rc) {
 		dev_err(dev, "Failed to get HID descriptor, rc=%d\n", rc);
@@ -941,7 +948,7 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 {
 	struct cyttsp5 *ts;
 	struct cyttsp5_sysinfo *si;
-	int error, i;
+	int error, i, attempt;
 
 	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
 	if (!ts)
@@ -1010,7 +1017,23 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 		return error;
 	}
 
-	error = cyttsp5_startup(ts);
+	/*
+	 * After a hard reset of the machine the controller can answer the
+	 * first commands with garbage (an invalid HID descriptor), and touch
+	 * stays dead until the driver is bound again. Reset it and try again.
+	 */
+	for (attempt = 1; ; attempt++) {
+		error = cyttsp5_startup(ts);
+		if (!error || attempt == CY_STARTUP_ATTEMPTS)
+			break;
+		dev_warn(ts->dev, "startup failed (%d), resetting the controller (attempt %d)\n",
+			 error, attempt + 1);
+		gpiod_set_value_cansleep(ts->reset_gpio, 1);
+		fsleep(1000);
+		gpiod_set_value_cansleep(ts->reset_gpio, 0);
+		msleep(100);
+		reinit_completion(&ts->cmd_done);
+	}
 	if (error) {
 		dev_err(ts->dev, "Fail initial startup r=%d\n", error);
 		return error;

@@ -78,6 +78,7 @@ extern int qcom_find_cfg_index(struct clk_hw *hw, const struct parent_map *map,
 extern int qcom_cc_register_board_clk(struct device *dev, const char *path,
 				      const char *name, unsigned long rate);
 extern int qcom_cc_register_sleep_clk(struct device *dev);
+extern void qcom_cc_hibernate_restore_late(void);
 
 extern struct regmap *qcom_cc_map(struct platform_device *pdev,
 				  const struct qcom_cc_desc *desc);

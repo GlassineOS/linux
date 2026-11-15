@@ -20,6 +20,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string_choices.h>
+#include <linux/suspend.h>
+#include <linux/syscore_ops.h>
 
 #include <linux/pinctrl/machine.h>
 #include <linux/pinctrl/pinconf-generic.h>
@@ -80,6 +82,10 @@ struct msm_pinctrl {
 	const struct msm_pinctrl_soc_data *soc;
 	void __iomem *regs[MAX_NR_TILES];
 	u32 phys_base[MAX_NR_TILES];
+
+	struct list_head hib_node;
+	u32 (*hib_regs)[3];
+	unsigned long *hib_saved;
 };
 
 #define MSM_ACCESSOR(name) \
@@ -1588,6 +1594,122 @@ SIMPLE_DEV_PM_OPS(msm_pinctrl_dev_pm_ops, msm_pinctrl_suspend,
 
 EXPORT_SYMBOL(msm_pinctrl_dev_pm_ops);
 
+/*
+ * Hibernation: a restore on a machine that was powered off in between finds
+ * the pins as the boot that loaded the image left them (pins of drivers that
+ * boot never loaded are at their reset state), while the restored drivers
+ * believe in their own settings. Save the control, output and interrupt
+ * configuration of every GPIO this kernel has muxed or requested at the
+ * syscore suspend before the snapshot, and write them back at the syscore
+ * resume that follows, before any device is restored. Pins this kernel never
+ * touched are never read: some are secure and a read of those resets the SoC.
+ */
+static LIST_HEAD(msm_pinctrl_hib_list);
+static bool msm_pinctrl_hibernating;
+
+static bool msm_pinctrl_hib_pin_used(struct msm_pinctrl *pctrl, unsigned int i)
+{
+	struct pin_desc *desc = pin_desc_get(pctrl->pctrl, i);
+
+	return desc && (desc->mux_owner || desc->gpio_owner) &&
+	       gpiochip_line_is_valid(&pctrl->chip, i);
+}
+
+static int msm_pinctrl_hib_save(void *data)
+{
+	struct msm_pinctrl *pctrl;
+	unsigned int i;
+
+	if (!msm_pinctrl_hibernating)
+		return 0;
+
+	list_for_each_entry(pctrl, &msm_pinctrl_hib_list, hib_node) {
+		bitmap_zero(pctrl->hib_saved, pctrl->chip.ngpio);
+		for (i = 0; i < pctrl->chip.ngpio; i++) {
+			const struct msm_pingroup *g = &pctrl->soc->groups[i];
+
+			if (!msm_pinctrl_hib_pin_used(pctrl, i))
+				continue;
+			pctrl->hib_regs[i][0] = msm_readl_ctl(pctrl, g);
+			pctrl->hib_regs[i][1] = msm_readl_io(pctrl, g);
+			pctrl->hib_regs[i][2] = msm_readl_intr_cfg(pctrl, g);
+			set_bit(i, pctrl->hib_saved);
+		}
+	}
+	return 0;
+}
+
+static void msm_pinctrl_hib_restore(void *data)
+{
+	struct msm_pinctrl *pctrl;
+	unsigned int i, n;
+
+	if (!msm_pinctrl_hibernating)
+		return;
+
+	list_for_each_entry(pctrl, &msm_pinctrl_hib_list, hib_node) {
+		n = 0;
+		for_each_set_bit(i, pctrl->hib_saved, pctrl->chip.ngpio) {
+			const struct msm_pingroup *g = &pctrl->soc->groups[i];
+
+			if (msm_readl_ctl(pctrl, g) == pctrl->hib_regs[i][0] &&
+			    msm_readl_intr_cfg(pctrl, g) == pctrl->hib_regs[i][2])
+				continue;
+			/* the output level first, so a pin turned output drives it */
+			msm_writel_io(pctrl->hib_regs[i][1], pctrl, g);
+			msm_writel_ctl(pctrl->hib_regs[i][0], pctrl, g);
+			msm_writel_intr_cfg(pctrl->hib_regs[i][2], pctrl, g);
+			n++;
+		}
+		if (n)
+			dev_info(pctrl->dev, "%u pins set again after the restore\n", n);
+	}
+}
+
+static const struct syscore_ops msm_pinctrl_hib_ops = {
+	.suspend = msm_pinctrl_hib_save,
+	.resume = msm_pinctrl_hib_restore,
+};
+
+static struct syscore msm_pinctrl_hib_syscore = {
+	.ops = &msm_pinctrl_hib_ops,
+};
+
+static int msm_pinctrl_hib_notify(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	if (action == PM_HIBERNATION_PREPARE)
+		msm_pinctrl_hibernating = true;
+	else if (action == PM_POST_HIBERNATION)
+		msm_pinctrl_hibernating = false;
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block msm_pinctrl_hib_nb = {
+	.notifier_call = msm_pinctrl_hib_notify,
+};
+
+static void msm_pinctrl_hib_add(struct msm_pinctrl *pctrl)
+{
+	static bool registered;
+	unsigned int n = pctrl->chip.ngpio;
+
+	if (!IS_ENABLED(CONFIG_HIBERNATION))
+		return;
+
+	pctrl->hib_regs = devm_kcalloc(pctrl->dev, n, sizeof(*pctrl->hib_regs), GFP_KERNEL);
+	pctrl->hib_saved = devm_bitmap_zalloc(pctrl->dev, n, GFP_KERNEL);
+	if (!pctrl->hib_regs || !pctrl->hib_saved)
+		return;
+
+	list_add_tail(&pctrl->hib_node, &msm_pinctrl_hib_list);
+	if (!registered) {
+		register_syscore(&msm_pinctrl_hib_syscore);
+		register_pm_notifier(&msm_pinctrl_hib_nb);
+		registered = true;
+	}
+}
+
 int msm_pinctrl_probe(struct platform_device *pdev,
 		      const struct msm_pinctrl_soc_data *soc_data)
 {
@@ -1664,6 +1786,7 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 		return ret;
 
 	platform_set_drvdata(pdev, pctrl);
+	msm_pinctrl_hib_add(pctrl);
 
 	dev_dbg(&pdev->dev, "Probed Qualcomm pinctrl driver\n");
 
