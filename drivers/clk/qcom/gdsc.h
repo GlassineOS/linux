@@ -86,12 +86,14 @@ struct gdsc_desc {
 	struct gdsc **scs;
 	size_t num;
 	struct dev_pm_domain_list *pd_list;
+	struct list_head node;
 };
 
 #ifdef CONFIG_QCOM_GDSC
 int gdsc_register(struct gdsc_desc *desc, struct reset_controller_dev *,
 		  struct regmap *);
 void gdsc_unregister(struct gdsc_desc *desc);
+void gdsc_hibernate_restore(void);
 int gdsc_gx_do_nothing_enable(struct generic_pm_domain *domain);
 int gdsc_gx_disable(struct generic_pm_domain *domain);
 #else
@@ -103,5 +105,6 @@ static inline int gdsc_register(struct gdsc_desc *desc,
 }
 
 static inline void gdsc_unregister(struct gdsc_desc *desc) {};
+static inline void gdsc_hibernate_restore(void) {};
 #endif /* CONFIG_QCOM_GDSC */
 #endif /* __QCOM_GDSC_H__ */

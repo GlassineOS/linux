@@ -798,7 +798,61 @@ static int clk_rcg2_set_duty_cycle(struct clk_hw *hw, struct clk_duty *duty)
 	return update_config(rcg);
 }
 
+/*
+ * Hibernation: the configuration of an RCG that is in use when the image is
+ * taken, written back after a restore on a machine that was powered off in
+ * between (the RCG then holds its reset or boot configuration). RCGs that are
+ * not in use are not touched: their controller may not be accessible.
+ */
+static int clk_rcg2_save_context(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+
+	rcg->ctx_saved = false;
+	if (!__clk_get_enable_count(hw->clk))
+		return 0;
+
+	if (regmap_read(map, RCG_CFG_OFFSET(rcg), &rcg->ctx_cfg))
+		return 0;
+	if (rcg->mnd_width &&
+	    (regmap_read(map, RCG_M_OFFSET(rcg), &rcg->ctx_m) ||
+	     regmap_read(map, RCG_N_OFFSET(rcg), &rcg->ctx_n) ||
+	     regmap_read(map, RCG_D_OFFSET(rcg), &rcg->ctx_d)))
+		return 0;
+
+	rcg->ctx_saved = true;
+	return 0;
+}
+
+static void clk_rcg2_restore_context(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	struct regmap *map = rcg->clkr.regmap;
+	u32 cfg;
+
+	if (!rcg->ctx_saved || !__clk_get_enable_count(hw->clk))
+		return;
+
+	if (regmap_read(map, RCG_CFG_OFFSET(rcg), &cfg) || cfg == rcg->ctx_cfg)
+		return;
+
+	if (rcg->mnd_width) {
+		regmap_write(map, RCG_M_OFFSET(rcg), rcg->ctx_m);
+		regmap_write(map, RCG_N_OFFSET(rcg), rcg->ctx_n);
+		regmap_write(map, RCG_D_OFFSET(rcg), rcg->ctx_d);
+	}
+	regmap_write(map, RCG_CFG_OFFSET(rcg), rcg->ctx_cfg);
+	/* the update takes effect only on a running root */
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, CMD_ROOT_EN);
+	if (update_config(rcg))
+		pr_warn("%s: configuration not restored\n", clk_hw_get_name(hw));
+	regmap_update_bits(map, rcg->cmd_rcgr + CMD_REG, CMD_ROOT_EN, 0);
+}
+
 const struct clk_ops clk_rcg2_ops = {
+	.save_context = clk_rcg2_save_context,
+	.restore_context = clk_rcg2_restore_context,
 	.is_enabled = clk_rcg2_is_enabled,
 	.get_parent = clk_rcg2_get_parent,
 	.set_parent = clk_rcg2_set_parent,
