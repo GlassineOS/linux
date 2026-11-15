@@ -21,6 +21,8 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mm.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/suspend.h>
 
 #include "internal.h"
 #include "ram_internal.h"
@@ -899,6 +901,27 @@ static const struct of_device_id dt_match[] = {
 	{}
 };
 MODULE_DEVICE_TABLE(of, dt_match);
+
+#ifdef CONFIG_HIBERNATION
+/*
+ * Keep a reserved-memory ramoops region out of the hibernation image. The
+ * region is mapped memory, so it would be saved and written back over what
+ * the kernel that loads the image (and the restored kernel after it) logged:
+ * the record of a failed restore would be lost, and the restored kernel would
+ * start from the hibernating boot's records instead.
+ */
+static int __init ramoops_rmem_nosave(unsigned long node, struct reserved_mem *rmem)
+{
+	register_nosave_region(PHYS_PFN(rmem->base),
+			       PHYS_PFN(rmem->base + rmem->size - 1) + 1);
+	return 0;
+}
+
+static const struct reserved_mem_ops ramoops_rmem_ops = {
+	.node_init = ramoops_rmem_nosave,
+};
+RESERVEDMEM_OF_DECLARE(ramoops_nosave, "ramoops", &ramoops_rmem_ops);
+#endif
 
 static struct platform_driver ramoops_driver = {
 	.probe		= ramoops_probe,
