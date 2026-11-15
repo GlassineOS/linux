@@ -10,6 +10,8 @@
 #include <linux/interconnect.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/ktime.h>
 #include <linux/pm_domain.h>
 #include <linux/regmap.h>
@@ -594,6 +596,51 @@ static void gdsc_pm_subdomain_remove(struct gdsc_desc *desc, size_t num)
 	}
 }
 
+static LIST_HEAD(gdsc_descs);
+static DEFINE_MUTEX(gdsc_descs_lock);
+
+/*
+ * gdsc_hibernate_restore - power the GDSCs on again that are on for the power
+ * domain framework but lost power with the machine: called with interrupts
+ * off from the syscore resume of a restore from hibernation, before any
+ * device's restore callback. Supplies and votes are not touched: the counts
+ * that hold them are part of the restored image.
+ */
+void gdsc_hibernate_restore(void)
+{
+	struct gdsc_desc *desc;
+	int i, n;
+
+	list_for_each_entry(desc, &gdsc_descs, node) {
+		for (i = 0; i < desc->num; i++) {
+			struct gdsc *sc = desc->scs[i];
+
+			if (!sc || sc->pd.status != GENPD_STATE_ON || sc->pwrsts == PWRSTS_ON)
+				continue;
+			if (gdsc_check_status(sc, GDSC_ON) != 0)
+				continue;
+
+			if (sc->flags & CLAMP_IO)
+				gdsc_deassert_clamp_io(sc);
+			gdsc_update_collapse_bit(sc, false);
+			for (n = 0; n < STATUS_POLL_TIMEOUT_US; n++) {
+				if (gdsc_check_status(sc, GDSC_ON) > 0)
+					break;
+				udelay(1);
+			}
+			if (sc->pwrsts & PWRSTS_OFF)
+				gdsc_force_mem_on(sc);
+			udelay(1);
+			if (sc->flags & RETAIN_FF_ENABLE)
+				gdsc_retain_ff_on(sc);
+			if (sc->flags & HW_CTRL)
+				gdsc_hwctrl(sc, true);
+			pr_info("%s: powered on again after the restore%s\n", sc->pd.name,
+				n < STATUS_POLL_TIMEOUT_US ? "" : " (no status)");
+		}
+	}
+}
+
 int gdsc_register(struct gdsc_desc *desc,
 		  struct reset_controller_dev *rcdev, struct regmap *regmap)
 {
@@ -667,7 +714,14 @@ int gdsc_register(struct gdsc_desc *desc,
 			goto err_pm_subdomain_remove;
 	}
 
-	return of_genpd_add_provider_onecell(dev->of_node, data);
+	ret = of_genpd_add_provider_onecell(dev->of_node, data);
+	if (ret)
+		return ret;
+
+	mutex_lock(&gdsc_descs_lock);
+	list_add_tail(&desc->node, &gdsc_descs);
+	mutex_unlock(&gdsc_descs_lock);
+	return 0;
 
 err_pm_subdomain_remove:
 	gdsc_pm_subdomain_remove(desc, i);
@@ -681,6 +735,10 @@ void gdsc_unregister(struct gdsc_desc *desc)
 	struct gdsc **scs = desc->scs;
 	size_t num = desc->num;
 	int i;
+
+	mutex_lock(&gdsc_descs_lock);
+	list_del(&desc->node);
+	mutex_unlock(&gdsc_descs_lock);
 
 	of_genpd_del_provider(dev->of_node);
 	gdsc_pm_subdomain_remove(desc, num);
