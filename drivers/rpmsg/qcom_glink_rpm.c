@@ -13,6 +13,8 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/moduleparam.h>
+#include <linux/reboot.h>
 #include <linux/regmap.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
@@ -31,6 +33,28 @@
 #define RPM_RX_FIFO_ID		0x72326170 /* r2ap */
 
 #define to_rpm_pipe(p) container_of(p, struct glink_rpm_pipe, native)
+
+/*
+ * Taking over the channels of an earlier kernel (after a kexec, the RPM keeps
+ * running and keeps them open; it does not open them again). Off unless the
+ * command line asks for it, and only used when the probe finds an earlier
+ * session in the FIFOs:
+ *   qcom_glink_rpm.adopt=NAME[:LCID[:RCID]]  the channel, the local id the
+ *       earlier kernel used (default 1: the first local open), the RPM's id
+ *       (default: taken from the RPM's first data)
+ *   qcom_glink_rpm.adopt_version=1  send VERSION all the same
+ *   qcom_glink_rpm.adopt_deadman=S  S seconds after the probe, log the
+ *       adopted channel's state and restart the machine (0: off)
+ */
+static char *adopt;
+module_param(adopt, charp, 0444);
+MODULE_PARM_DESC(adopt, "take over NAME[:LCID[:RCID]] from an earlier kernel");
+static bool adopt_version;
+module_param(adopt_version, bool, 0444);
+MODULE_PARM_DESC(adopt_version, "send VERSION when adopting");
+static unsigned int adopt_deadman;
+module_param(adopt_deadman, uint, 0444);
+MODULE_PARM_DESC(adopt_deadman, "seconds until report and restart when adopting (0: off)");
 
 struct rpm_toc_entry {
 	__le32 id;
@@ -64,6 +88,8 @@ struct glink_rpm {
 
 	struct glink_rpm_pipe rx_pipe;
 	struct glink_rpm_pipe tx_pipe;
+
+	struct delayed_work deadman;
 };
 
 static size_t glink_rpm_rx_avail(struct qcom_glink_pipe *glink_pipe)
@@ -285,8 +311,60 @@ err_inval:
 	return -EINVAL;
 }
 
+static void glink_rpm_deadman(struct work_struct *work)
+{
+	struct glink_rpm *rpm = container_of(to_delayed_work(work),
+					     struct glink_rpm, deadman);
+
+	qcom_glink_native_adopt_report(rpm->glink);
+	pr_emerg("qcom_glink_rpm: KXADOPT: deadman after %u s, restarting\n",
+		 adopt_deadman);
+	emergency_restart();
+}
+
+static void glink_rpm_adopt(struct glink_rpm *rpm, struct device *dev)
+{
+	unsigned int lcid = 1, rcid = 0;
+	char *buf, *p, *name, *tok;
+	int ret;
+
+	/* armed first: whatever happens to the channel, the machine restarts */
+	if (adopt_deadman) {
+		schedule_delayed_work(&rpm->deadman, adopt_deadman * HZ);
+		dev_info(dev, "KXADOPT: deadman armed, %u s\n", adopt_deadman);
+	}
+
+	buf = kstrdup(adopt, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	p = buf;
+	name = strsep(&p, ":");
+	tok = strsep(&p, ":");
+	if (tok && kstrtouint(tok, 0, &lcid))
+		goto bad;
+	tok = strsep(&p, ":");
+	if (tok && kstrtouint(tok, 0, &rcid))
+		goto bad;
+	if (!*name || !lcid || lcid > U16_MAX || rcid > U16_MAX)
+		goto bad;
+
+	dev_info(dev, "KXADOPT: adopting %s, local id %u, remote id %u%s\n",
+		 name, lcid, rcid, rcid ? "" : " (learn)");
+	ret = qcom_glink_native_adopt(rpm->glink, name, lcid, rcid);
+	if (ret)
+		dev_err(dev, "KXADOPT: adopting %s failed: %d\n", name, ret);
+	kfree(buf);
+	return;
+
+bad:
+	dev_err(dev, "KXADOPT: cannot parse adopt=%s\n", adopt);
+	kfree(buf);
+}
+
 static int glink_rpm_probe(struct platform_device *pdev)
 {
+	bool earlier = false;
 	struct qcom_glink *glink;
 	struct glink_rpm *rpm;
 	struct device_node *np;
@@ -299,6 +377,7 @@ static int glink_rpm_probe(struct platform_device *pdev)
 	rpm = devm_kzalloc(&pdev->dev, sizeof(*rpm), GFP_KERNEL);
 	if (!rpm)
 		return -ENOMEM;
+	INIT_DELAYED_WORK(&rpm->deadman, glink_rpm_deadman);
 
 	np = of_parse_phandle(dev->of_node, "qcom,rpm-msg-ram", 0);
 	ret = of_address_to_resource(np, 0, &r);
@@ -352,16 +431,25 @@ static int glink_rpm_probe(struct platform_device *pdev)
 			 readl(rpm->rx_pipe.head), readl(rpm->rx_pipe.tail));
 		writel(readl(rpm->tx_pipe.tail), rpm->tx_pipe.head);
 		writel(readl(rpm->rx_pipe.head), rpm->rx_pipe.tail);
+		earlier = true;
 	} else {
 		writel(0, rpm->tx_pipe.head);
 		writel(0, rpm->rx_pipe.tail);
 	}
 
-	glink = qcom_glink_native_probe(dev,
-					0,
-					&rpm->rx_pipe.native,
-					&rpm->tx_pipe.native,
-					true);
+	if (adopt && !earlier)
+		dev_info(dev, "KXADOPT: no earlier session, normal start\n");
+	if (adopt && earlier && !adopt_version)
+		glink = qcom_glink_native_probe_resume(dev, 0,
+						       &rpm->rx_pipe.native,
+						       &rpm->tx_pipe.native,
+						       true);
+	else
+		glink = qcom_glink_native_probe(dev,
+						0,
+						&rpm->rx_pipe.native,
+						&rpm->tx_pipe.native,
+						true);
 	if (IS_ERR(glink)) {
 		mbox_free_channel(rpm->mbox_chan);
 		return PTR_ERR(glink);
@@ -373,6 +461,10 @@ static int glink_rpm_probe(struct platform_device *pdev)
 
 	enable_irq(rpm->irq);
 
+	/* after enable_irq(): the channel's driver sends at once and waits for acks */
+	if (adopt && earlier)
+		glink_rpm_adopt(rpm, dev);
+
 	return 0;
 }
 
@@ -381,6 +473,7 @@ static void glink_rpm_remove(struct platform_device *pdev)
 	struct glink_rpm *rpm = platform_get_drvdata(pdev);
 	struct qcom_glink *glink = rpm->glink;
 
+	cancel_delayed_work_sync(&rpm->deadman);
 	disable_irq(rpm->irq);
 
 	qcom_glink_native_remove(glink);
