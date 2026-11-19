@@ -288,8 +288,9 @@ struct cpr_thread {
 /*
  * After a kexec the CPRh still serves the OSM with the earlier kernel's
  * corners: cpr3.adopt=1 keeps that programming (no reconfiguration, no corner
- * writes) when the CPRh-OSM interface is found enabled. Off by default, and a
- * cold boot (interface off) is unchanged either way.
+ * writes) when the CPRh-OSM interface is found enabled. With it set the CPRh
+ * is never written: if the interface is found off, the attach fails instead
+ * (no cpufreq, the CPUs stay where they are). Off by default.
  */
 static bool cpr3_adopt;
 module_param_named(adopt, cpr3_adopt, bool, 0444);
@@ -1543,6 +1544,11 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 	 */
 	if (drv->adopted)
 		goto corners;
+	if (cpr3_adopt) {
+		dev_err(drv->dev, "KXADOPT: CPRh thread %d: OSM interface was off, not programming it under cpr3.adopt\n",
+			thread->id);
+		return -EBUSY;
+	}
 
 	/* Disable the interface between OSM and CPRh */
 	cpr_masked_write(thread, drv->reg_ctl,
@@ -3011,11 +3017,11 @@ static int cpr_probe(struct platform_device *pdev)
 		dev_info(dev, "KXADOPT: CPRh ctl 0x%08x cpr_ctl 0x%08x: %s\n", ctl,
 			 cpr_read(&drv->threads[0], CPR3_REG_CPR_CTL),
 			 drv->adopted ? "OSM interface on, adopted (no reconfiguration)" :
-					"OSM interface off, configuring as usual");
+					"OSM interface off: left alone, the attach will refuse");
 	}
 
-	/* Write initial configuration on all threads */
-	for (i = 0; i < desc->num_threads && !drv->adopted; i++) {
+	/* Write initial configuration on all threads (never under cpr3.adopt) */
+	for (i = 0; i < desc->num_threads && !(cpr3_adopt && desc->cpr_type == CTRL_TYPE_CPRH); i++) {
 		ret = cpr_configure(&drv->threads[i]);
 		if (ret)
 			goto unreg_genpd;
