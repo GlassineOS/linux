@@ -101,6 +101,7 @@ struct glink_core_rx_intent {
  * @tx_avail_notify: Waitqueue for pending tx tasks
  * @sent_read_notify: flag to check cmd sent or not
  * @abort_tx:	flag indicating that all tx attempts should fail
+ * @adopt_pending: adopted channel whose remote id is not known yet
  */
 struct qcom_glink {
 	struct device *dev;
@@ -126,6 +127,8 @@ struct qcom_glink {
 	bool sent_read_notify;
 
 	bool abort_tx;
+
+	struct glink_channel *adopt_pending;
 };
 
 enum {
@@ -159,6 +162,9 @@ enum {
  * @intent_req_result: Result of intent request
  * @intent_received: flag indicating that an intent has been received
  * @intent_req_wq: wait queue for intent_req signalling
+ * @adopted:	taken over from an earlier kernel, see qcom_glink_native_adopt()
+ * @adopt_tx:	messages sent on an adopted channel
+ * @adopt_rx:	messages received on an adopted channel
  */
 struct glink_channel {
 	struct rpmsg_endpoint ept;
@@ -191,6 +197,10 @@ struct glink_channel {
 	int intent_req_result;
 	bool intent_received;
 	wait_queue_head_t intent_req_wq;
+
+	bool adopted;
+	atomic_t adopt_tx;
+	atomic_t adopt_rx;
 };
 
 #define to_glink_channel(_ept) container_of(_ept, struct glink_channel, ept)
@@ -929,7 +939,23 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
 	liid = le32_to_cpu(hdr.msg.param2);
 	spin_lock_irqsave(&glink->idr_lock, flags);
 	channel = idr_find(&glink->rcids, rcid);
-	spin_unlock_irqrestore(&glink->idr_lock, flags);
+	if (!channel && glink->adopt_pending &&
+	    idr_alloc(&glink->rcids, glink->adopt_pending, rcid, rcid + 1,
+		      GFP_ATOMIC) == rcid) {
+		/*
+		 * The remote addresses its data with its own channel id. With
+		 * one adopted channel waiting for its id, the first data on an
+		 * unknown id is that channel's.
+		 */
+		channel = glink->adopt_pending;
+		channel->rcid = rcid;
+		glink->adopt_pending = NULL;
+		spin_unlock_irqrestore(&glink->idr_lock, flags);
+		dev_info(glink->dev, "KXADOPT: %s: remote id %u learned from its first data\n",
+			 channel->name, rcid);
+	} else {
+		spin_unlock_irqrestore(&glink->idr_lock, flags);
+	}
 
 	trace_qcom_glink_cmd_tx_data_rx(glink->label, channel ? channel->name : NULL,
 					channel ? channel->lcid : 0, rcid,
@@ -991,6 +1017,9 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
 
 	/* Handle message when no fragments remain to be received */
 	if (!left_size) {
+		if (channel->adopted && atomic_inc_return(&channel->adopt_rx) == 1)
+			dev_info(glink->dev, "KXADOPT: %s: first message from the remote (%d bytes)\n",
+				 channel->name, intent->offset);
 		spin_lock(&channel->recv_lock);
 		if (channel->ept.cb) {
 			channel->ept.cb(channel->ept.rpdev,
@@ -1331,6 +1360,15 @@ static struct rpmsg_endpoint *qcom_glink_create_ept(struct rpmsg_device *rpdev,
 	int ret;
 	unsigned long flags;
 
+	/*
+	 * An adopted channel is open on both ends already: no OPEN, no
+	 * OPEN_ACK, and no CLOSE on a timeout that would end it.
+	 */
+	if (parent->adopted && !strcmp(parent->name, name)) {
+		channel = parent;
+		goto setup_ept;
+	}
+
 	spin_lock_irqsave(&glink->idr_lock, flags);
 	idr_for_each_entry(&glink->rcids, channel, cid) {
 		if (!strcmp(channel->name, name))
@@ -1348,6 +1386,7 @@ static struct rpmsg_endpoint *qcom_glink_create_ept(struct rpmsg_device *rpdev,
 			return NULL;
 	}
 
+setup_ept:
 	ept = &channel->ept;
 	ept->rpdev = rpdev;
 	ept->cb = cb;
@@ -1547,6 +1586,10 @@ static int __qcom_glink_send(struct glink_channel *channel,
 		offset += chunk_size;
 	}
 
+	if (channel->adopted && atomic_inc_return(&channel->adopt_tx) == 1)
+		dev_info(glink->dev, "KXADOPT: %s: first message sent [%u/%u]\n",
+			 channel->name, channel->lcid, channel->rcid);
+
 	return 0;
 }
 
@@ -1655,7 +1698,13 @@ static int qcom_glink_rx_open(struct qcom_glink *glink, unsigned int rcid,
 
 	trace_qcom_glink_cmd_open_rx(glink->label, name, channel->lcid, rcid);
 
+	if (channel->adopted)
+		dev_info(glink->dev, "KXADOPT: %s: the remote opens it again (remote id %u)\n",
+			 name, rcid);
+
 	spin_lock_irqsave(&glink->idr_lock, flags);
+	if (channel == glink->adopt_pending)
+		glink->adopt_pending = NULL;
 	ret = idr_alloc(&glink->rcids, channel, rcid, rcid + 1, GFP_ATOMIC);
 	if (ret < 0) {
 		dev_err(glink->dev, "Unable to insert channel into rcid list\n");
@@ -1885,11 +1934,12 @@ static int qcom_glink_create_chrdev(struct qcom_glink *glink)
 	return rpmsg_ctrldev_register_device(rpdev);
 }
 
-struct qcom_glink *qcom_glink_native_probe(struct device *dev,
-					   unsigned long features,
-					   struct qcom_glink_pipe *rx,
-					   struct qcom_glink_pipe *tx,
-					   bool intentless)
+static struct qcom_glink *__qcom_glink_native_probe(struct device *dev,
+						    unsigned long features,
+						    struct qcom_glink_pipe *rx,
+						    struct qcom_glink_pipe *tx,
+						    bool intentless,
+						    bool send_version)
 {
 	int ret;
 	struct qcom_glink *glink;
@@ -1925,9 +1975,11 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 	if (ret)
 		dev_err(dev, "failed to add groups\n");
 
-	ret = qcom_glink_send_version(glink);
-	if (ret)
-		return ERR_PTR(ret);
+	if (send_version) {
+		ret = qcom_glink_send_version(glink);
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	ret = qcom_glink_create_chrdev(glink);
 	if (ret)
@@ -1935,7 +1987,166 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 
 	return glink;
 }
+
+struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+					   unsigned long features,
+					   struct qcom_glink_pipe *rx,
+					   struct qcom_glink_pipe *tx,
+					   bool intentless)
+{
+	return __qcom_glink_native_probe(dev, features, rx, tx, intentless, true);
+}
 EXPORT_SYMBOL_GPL(qcom_glink_native_probe);
+
+/*
+ * As qcom_glink_native_probe(), but without the VERSION: for an edge whose
+ * session an earlier kernel negotiated and left running, where the channels
+ * are taken over with qcom_glink_native_adopt().
+ */
+struct qcom_glink *qcom_glink_native_probe_resume(struct device *dev,
+						  unsigned long features,
+						  struct qcom_glink_pipe *rx,
+						  struct qcom_glink_pipe *tx,
+						  bool intentless)
+{
+	return __qcom_glink_native_probe(dev, features, rx, tx, intentless, false);
+}
+EXPORT_SYMBOL_GPL(qcom_glink_native_probe_resume);
+
+/**
+ * qcom_glink_native_adopt() - take over a channel an earlier kernel left open
+ * @glink:	the edge, its interrupt already enabled
+ * @name:	the channel's name; a child of the edge's node must name it
+ * @lcid:	the local id the earlier kernel used
+ * @rcid:	the remote's id, or 0 to take it from the remote's first data
+ *
+ * A remote that keeps running across a kexec (the RPM) still holds the
+ * channel open, with the earlier kernel's local id, and does not open it
+ * again. The channel is set up as fully open, with no OPEN or OPEN_ACK
+ * sent, and its rpmsg device is registered as after a remote open, so the
+ * driver starts as on a cold boot and its first request goes out on the
+ * old ids.
+ *
+ * Return: 0 on success, negative errno otherwise.
+ */
+int qcom_glink_native_adopt(struct qcom_glink *glink, const char *name,
+			    unsigned int lcid, unsigned int rcid)
+{
+	struct glink_channel *channel;
+	struct rpmsg_device *rpdev;
+	struct device_node *node;
+	unsigned long flags;
+	int ret;
+
+	node = qcom_glink_match_channel(glink->dev->of_node, name);
+	if (!node) {
+		dev_err(glink->dev, "KXADOPT: no child node for channel %s\n", name);
+		return -ENODEV;
+	}
+
+	channel = qcom_glink_alloc_channel(glink, name);
+	if (IS_ERR(channel)) {
+		of_node_put(node);
+		return PTR_ERR(channel);
+	}
+	channel->adopted = true;
+	atomic_set(&channel->adopt_tx, 0);
+	atomic_set(&channel->adopt_rx, 0);
+
+	spin_lock_irqsave(&glink->idr_lock, flags);
+	ret = idr_alloc(&glink->lcids, channel, lcid, lcid + 1, GFP_ATOMIC);
+	if (ret < 0)
+		goto unlock;
+	channel->lcid = lcid;
+	if (rcid) {
+		ret = idr_alloc(&glink->rcids, channel, rcid, rcid + 1, GFP_ATOMIC);
+		if (ret < 0) {
+			idr_remove(&glink->lcids, lcid);
+			goto unlock;
+		}
+		channel->rcid = rcid;
+	} else {
+		glink->adopt_pending = channel;
+	}
+	/* the references an open channel holds: the remote's open and ours */
+	kref_get(&channel->refcount);
+	ret = 0;
+unlock:
+	spin_unlock_irqrestore(&glink->idr_lock, flags);
+	if (ret < 0) {
+		dev_err(glink->dev, "KXADOPT: %s: ids %u/%u taken: %d\n", name, lcid, rcid, ret);
+		goto free_channel;
+	}
+
+	complete_all(&channel->open_req);
+	complete_all(&channel->open_ack);
+
+	dev_info(glink->dev, "KXADOPT: %s: adopted, local id %u, remote id %s%u\n",
+		 name, lcid, rcid ? "" : "learned from the first data, hint ", rcid);
+
+	rpdev = kzalloc_obj(*rpdev);
+	if (!rpdev) {
+		ret = -ENOMEM;
+		goto remove_ids;
+	}
+
+	rpdev->ept = &channel->ept;
+	strscpy(rpdev->id.name, name);
+	rpdev->src = RPMSG_ADDR_ANY;
+	rpdev->dst = RPMSG_ADDR_ANY;
+	rpdev->ops = &glink_device_ops;
+	rpdev->dev.of_node = node;
+	rpdev->dev.parent = glink->dev;
+	rpdev->dev.release = qcom_glink_rpdev_release;
+
+	ret = rpmsg_register_device(rpdev);
+	if (ret) {
+		dev_err(glink->dev, "KXADOPT: %s: rpmsg device: %d\n", name, ret);
+		goto remove_ids;
+	}
+	channel->rpdev = rpdev;
+
+	dev_info(glink->dev, "KXADOPT: %s: rpmsg device registered\n", name);
+	return 0;
+
+remove_ids:
+	spin_lock_irqsave(&glink->idr_lock, flags);
+	idr_remove(&glink->lcids, channel->lcid);
+	if (channel->rcid)
+		idr_remove(&glink->rcids, channel->rcid);
+	if (glink->adopt_pending == channel)
+		glink->adopt_pending = NULL;
+	spin_unlock_irqrestore(&glink->idr_lock, flags);
+	kref_put(&channel->refcount, qcom_glink_channel_release);
+free_channel:
+	kref_put(&channel->refcount, qcom_glink_channel_release);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_glink_native_adopt);
+
+/**
+ * qcom_glink_native_adopt_report() - log the state of the adopted channels
+ * @glink:	the edge
+ */
+void qcom_glink_native_adopt_report(struct qcom_glink *glink)
+{
+	struct glink_channel *channel;
+	unsigned long flags;
+	int cid;
+
+	spin_lock_irqsave(&glink->idr_lock, flags);
+	idr_for_each_entry(&glink->lcids, channel, cid) {
+		if (!channel->adopted)
+			continue;
+		dev_info(glink->dev, "KXADOPT: report %s [%u/%u] sent %d received %d%s\n",
+			 channel->name, channel->lcid, channel->rcid,
+			 atomic_read(&channel->adopt_tx),
+			 atomic_read(&channel->adopt_rx),
+			 channel == glink->adopt_pending ? " (remote id never seen)" : "");
+	}
+	spin_unlock_irqrestore(&glink->idr_lock, flags);
+}
+EXPORT_SYMBOL_GPL(qcom_glink_native_adopt_report);
 
 static int qcom_glink_remove_device(struct device *dev, void *data)
 {
