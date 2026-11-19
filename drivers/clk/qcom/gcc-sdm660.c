@@ -994,7 +994,8 @@ static struct clk_rcg2 usb3_phy_aux_clk_src = {
 
 static struct clk_branch gcc_aggre2_ufs_axi_clk = {
 	.halt_reg = 0x75034,
-	.halt_check = BRANCH_HALT,
+	/* behind a GDSC the a2noc does not power: see gcc_ufs_axi_clk */
+	.halt_check = BRANCH_HALT_SKIP,
 	.clkr = {
 		.enable_reg = 0x75034,
 		.enable_mask = BIT(0),
@@ -1011,7 +1012,8 @@ static struct clk_branch gcc_aggre2_ufs_axi_clk = {
 
 static struct clk_branch gcc_aggre2_usb3_axi_clk = {
 	.halt_reg = 0xf03c,
-	.halt_check = BRANCH_HALT,
+	/* behind a GDSC the a2noc does not power: see gcc_ufs_axi_clk */
+	.halt_check = BRANCH_HALT_SKIP,
 	.clkr = {
 		.enable_reg = 0xf03c,
 		.enable_mask = BIT(0),
@@ -1970,7 +1972,16 @@ static struct clk_branch gcc_ufs_ahb_clk = {
 
 static struct clk_branch gcc_ufs_axi_clk = {
 	.halt_reg = 0x75008,
-	.halt_check = BRANCH_HALT,
+	/*
+	 * The a2noc enables this clock, gcc_aggre2_ufs_axi_clk and
+	 * gcc_aggre2_usb3_axi_clk at probe, but they sit behind the UFS and
+	 * USB 3.0 GDSCs, which it does not power. When a GDSC is off at that
+	 * point (a kernel started by kexec: the earlier one powered the unused
+	 * UFS GDSC off), the branch never reports on and the a2noc, with
+	 * everything behind it, fails to probe. Don't wait for the status;
+	 * the clock runs once its GDSC is on.
+	 */
+	.halt_check = BRANCH_HALT_SKIP,
 	.clkr = {
 		.enable_reg = 0x75008,
 		.enable_mask = BIT(0),
