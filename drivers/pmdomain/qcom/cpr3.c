@@ -285,6 +285,16 @@ struct cpr_thread {
 	const struct cpr_thread_desc *desc;
 };
 
+/*
+ * After a kexec the CPRh still serves the OSM with the earlier kernel's
+ * corners: cpr3.adopt=1 keeps that programming (no reconfiguration, no corner
+ * writes) when the CPRh-OSM interface is found enabled. Off by default, and a
+ * cold boot (interface off) is unchanged either way.
+ */
+static bool cpr3_adopt;
+module_param_named(adopt, cpr3_adopt, bool, 0444);
+MODULE_PARM_DESC(adopt, "keep a running CPRh's programming (after kexec)");
+
 struct cpr_drv {
 	int			irq;
 	unsigned int		ref_clk_khz;
@@ -306,6 +316,7 @@ struct cpr_drv {
 	unsigned int		vreg_step;
 	bool			enabled;
 	bool			open_loop_only;
+	bool			adopted;
 
 	struct cpr_thread	*threads;
 	struct genpd_onecell_data cell_data;
@@ -1206,7 +1217,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 	const struct cpr_desc *desc = drv->desc;
 	const struct cpr_thread_desc *tdesc = thread->desc;
 	const struct cpr_fuse *fuses = thread->cpr_fuses;
-	int i, ret, total_corners, extra_corners, level, scaling = 0;
+	int i, ret, total_corners, extra_corners, level, scaling = 0, adopt_diff = 0;
 	unsigned int fnum, fc;
 	const char *quot_offset;
 	const struct fuse_corner_data *fdata;
@@ -1524,6 +1535,15 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 	/* Reassign extra_corners, as we have to exclude delta_quot for them */
 	extra_corners = drv->extra_corners;
 
+	/*
+	 * Adopted (after kexec): the OSM runs on the earlier kernel's corners.
+	 * Compute them as usual (the OPP voltages above match a cold boot) but
+	 * only compare them with the hardware: disabling the OSM interface or
+	 * rewriting a corner under a running OSM could under-volt the CPUs.
+	 */
+	if (drv->adopted)
+		goto corners;
+
 	/* Disable the interface between OSM and CPRh */
 	cpr_masked_write(thread, drv->reg_ctl,
 			 CPRH_CTL_OSM_ENABLED, 0);
@@ -1557,6 +1577,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 			 tgt_quot_val, tgt_quot_reg);
 	}
 
+corners:
 	for (i = 0; i < total_corners; i++) {
 		int volt_oloop_steps, volt_floor_steps, delta_quot_steps;
 		int ring_osc;
@@ -1614,11 +1635,28 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 			dev_dbg(drv->dev, "Disabling Closed-Loop on corner %d\n", i);
 			val |= CPRH_CORNER_CPR_CL_DISABLE;
 		}
+		if (drv->adopted) {
+			u32 hw = cpr_read(thread, CPRH_REG_CORNER(drv, tdesc->hw_tid, i));
+
+			if (hw != val) {
+				adopt_diff++;
+				dev_warn(drv->dev, "KXADOPT: thread %d corner %d: hardware 0x%08x, computed 0x%08x\n",
+					 thread->id, i, hw, val);
+			}
+			continue;
+		}
 		cpr_write(thread, CPRH_REG_CORNER(drv, tdesc->hw_tid, i), val);
 
 		dev_dbg(drv->dev, "steps [%d]: open-loop %d, floor %d, delta_quot %d\n",
 			i, volt_oloop_steps, volt_floor_steps,
 			delta_quot_steps);
+	}
+
+	if (drv->adopted) {
+		dev_info(drv->dev, "KXADOPT: CPRh thread %d adopted: %d corners kept, %d differ from this kernel's\n",
+			 thread->id, total_corners, adopt_diff);
+		devm_kfree(drv->dev, cdata);
+		return 0;
 	}
 
 	/* YAY! Setup is done! Enable the internal loop to start CPR. */
@@ -2961,8 +2999,23 @@ static int cpr_probe(struct platform_device *pdev)
 	if (ret)
 		goto unreg_genpd;
 
+	/*
+	 * After a kexec (on request): a CPRh whose OSM interface is enabled is
+	 * serving the running OSM. cpr_configure() would stop its loop and mask
+	 * its ring oscillators under it: keep the earlier kernel's setup.
+	 */
+	if (cpr3_adopt && desc->cpr_type == CTRL_TYPE_CPRH) {
+		u32 ctl = cpr_read(&drv->threads[0], drv->reg_ctl);
+
+		drv->adopted = ctl & CPRH_CTL_OSM_ENABLED;
+		dev_info(dev, "KXADOPT: CPRh ctl 0x%08x cpr_ctl 0x%08x: %s\n", ctl,
+			 cpr_read(&drv->threads[0], CPR3_REG_CPR_CTL),
+			 drv->adopted ? "OSM interface on, adopted (no reconfiguration)" :
+					"OSM interface off, configuring as usual");
+	}
+
 	/* Write initial configuration on all threads */
-	for (i = 0; i < desc->num_threads; i++) {
+	for (i = 0; i < desc->num_threads && !drv->adopted; i++) {
 		ret = cpr_configure(&drv->threads[i]);
 		if (ret)
 			goto unreg_genpd;
