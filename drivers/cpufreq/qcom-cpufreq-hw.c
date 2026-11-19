@@ -309,6 +309,17 @@ static struct {
 static unsigned long cpu_hw_rate, xo_rate;
 static bool icc_scaling_enabled;
 
+/*
+ * After a kexec the OSM still runs on the earlier kernel's programming (LUT,
+ * sequencer, CPRh corners). qcom_cpufreq_hw.adopt=1 keeps it: no register is
+ * written, the LUT is read back as it is. Pair it with cpr3.adopt=1, or the
+ * CPRh attach rewrites the corners under the running OSM. Only used when the
+ * OSM domain is found enabled; a cold boot is unchanged.
+ */
+static bool qcom_cpufreq_adopt;
+module_param_named(adopt, qcom_cpufreq_adopt, bool, 0444);
+MODULE_PARM_DESC(adopt, "keep an OSM programmed by an earlier kernel (after kexec)");
+
 /**
  * qcom_cpufreq_set_bw() - Set interconnect bandwidth
  * @policy:   CPUFreq policy structure
@@ -1030,7 +1041,7 @@ static int qcom_cpufreq_hw_acd_init(struct device *cpu_dev,
  */
 static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 				     struct cpufreq_policy *policy,
-				     int cpu_count, int index)
+				     int cpu_count, int index, bool adopt)
 {
 	struct platform_device *pdev = cpufreq_get_driver_data();
 	struct qcom_cpufreq_data *ddata = policy->driver_data;
@@ -1070,6 +1081,38 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 	if (num_entries < 2) {
 		dev_err(&pdev->dev, "Not enough LUT entries found (%u)\n", num_entries);
 		return -EINVAL;
+	}
+
+	/*
+	 * Adopted: the earlier kernel's LUT stays. Compare it with what this
+	 * kernel would write (the same frequency plan and fuses give the same
+	 * table), for the log only: the LUT is read back as it is either way.
+	 */
+	if (adopt) {
+		int diff = 0;
+
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			struct qcom_cpufreq_hw_params *entry;
+			int pos = i * sdata->lut_row_size;
+			u32 hf, hv, ho, hs;
+
+			entry = &hw_tbl[i < num_entries ? i : num_entries - 1];
+			hf = readl(ddata->base + sdata->reg_freq_lut + pos);
+			hv = readl(ddata->base + sdata->reg_volt_lut + pos);
+			ho = readl(ddata->base + sregs->reg_override + pos);
+			hs = readl(ddata->base + sregs->reg_spare + pos);
+			if (hf == entry->freq_lut_val && hv == entry->volt_lut_val &&
+			    ho == entry->override_val && hs == entry->spare_val)
+				continue;
+			diff++;
+			dev_warn(cpu_dev, "KXADOPT: OSM LUT[%d]: hardware f 0x%08x v 0x%08x o 0x%08x s %u, computed f 0x%08x v 0x%08x o 0x%08x s %u\n",
+				 i, hf, hv, ho, hs, entry->freq_lut_val, entry->volt_lut_val,
+				 entry->override_val, entry->spare_val);
+		}
+		dev_info(cpu_dev, "KXADOPT: OSM domain %d adopted: %u LUT entries, %d of %u rows differ from this kernel's\n",
+			 index, num_entries, diff, LUT_MAX_ENTRIES);
+		devm_kfree(&pdev->dev, hw_tbl);
+		return 0;
 	}
 
 	for (i = 0; i < LUT_MAX_ENTRIES; i++) {
@@ -1699,12 +1742,22 @@ static int qcom_cpufreq_hw_osm_setup(struct device *cpu_dev,
 	dev_info(cpu_dev, "OSM domain %d: enable=0x%x perf_state=0x%x\n", index, val,
 		 readl(drv_data->base + qcom_cpufreq.soc_data->reg_perf_state));
 	if (val & 0x1) {
-		dev_err(cpu_dev, "OSM domain %d already enabled, refusing to reprogram it\n",
-			index);
-		return -EBUSY;
+		if (!qcom_cpufreq_adopt) {
+			dev_err(cpu_dev, "OSM domain %d already enabled, refusing to reprogram it\n",
+				index);
+			return -EBUSY;
+		}
+		/*
+		 * Keep it: attach to the CPRh and compute the table as on a cold
+		 * boot (the same software state), but write nothing: no LUT, no
+		 * sequencer, no ACD, no perf state, no enable.
+		 */
+		dev_info(cpu_dev, "KXADOPT: OSM domain %d already enabled (perf_state %u): adopting it\n",
+			 index, readl(drv_data->base + qcom_cpufreq.soc_data->reg_perf_state));
+		return qcom_cpufreq_hw_write_lut(cpu_dev, policy, cpu_count, index, true);
 	}
 
-	ret = qcom_cpufreq_hw_write_lut(cpu_dev, policy, cpu_count, index);
+	ret = qcom_cpufreq_hw_write_lut(cpu_dev, policy, cpu_count, index, false);
 	if (ret)
 		return dev_err_probe(cpu_dev, ret, "Couldn't write LUT to hardware\n");
 
