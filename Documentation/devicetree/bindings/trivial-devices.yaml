@@ -398,6 +398,10 @@ properties:
           - oki,ml86v7667
             # ON Semiconductor ADT7462 Temperature, Voltage Monitor and Fan Controller
           - onnn,adt7462
+            # Onyx Boox Note Air e-ink link: the MAX17135 panel power IC on its I2C bus
+          - onyx,na1-max17135
+            # Onyx Boox Note Air e-ink link: the TC358762 bridge's I2C register port
+          - onyx,na1-tc358762
             # 48-Lane, 12-Port PCI Express Gen 2 (5.0 GT/s) Switch
           - plx,pex8648
             # Pulsedlight LIDAR range-finding sensor
