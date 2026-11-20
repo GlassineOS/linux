@@ -206,8 +206,11 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to check if watchdog is active: %d\n", err);
 		return err;
 	}
-	if (val & S2_RESET_EN_BIT)
+	if (val & S2_RESET_EN_BIT) {
+		/* left on by whatever ran before: the core pets it until it is opened */
+		dev_info(dev, "running at probe (left enabled by the previous boot)\n");
 		set_bit(WDOG_HW_RUNNING, &wdt->wdev.status);
+	}
 
 	/* Configure watchdog to hard-reset mode */
 	err = regmap_write(wdt->regmap,
@@ -229,6 +232,8 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 
 	watchdog_init_timeout(&wdt->wdev, 0, dev);
 	pm8916_wdt_configure_timers(&wdt->wdev);
+	/* never left counting across a reboot or power-off, into a kernel that may not pet it */
+	watchdog_stop_on_reboot(&wdt->wdev);
 
 	return devm_watchdog_register_device(dev, &wdt->wdev);
 }
@@ -247,8 +252,17 @@ static int __maybe_unused pm8916_wdt_resume(struct device *dev)
 {
 	struct pm8916_wdt *wdt = dev_get_drvdata(dev);
 
-	if (watchdog_active(&wdt->wdev))
+	if (watchdog_active(&wdt->wdev)) {
+		/*
+		 * A fresh period first: userspace (frozen until later in the resume) gets the
+		 * whole timeout for its next ping, whatever the count held when it stopped.
+		 */
+		int err = pm8916_wdt_ping(&wdt->wdev);
+
+		if (err)
+			return err;
 		return pm8916_wdt_start(&wdt->wdev);
+	}
 
 	return 0;
 }
