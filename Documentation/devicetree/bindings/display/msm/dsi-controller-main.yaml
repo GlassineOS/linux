@@ -117,6 +117,12 @@ properties:
       Indicates if the DSI controller is the master DSI controller when
       qcom,dual-dsi-mode enabled.
 
+  qcom,cmd-rgb-swap-grb:
+    type: boolean
+    description:
+      In command mode, send the pixel components in G, R, B order instead
+      of R, G, B. For links whose receiver expects that byte order.
+
   qcom,sync-dual-dsi:
     type: boolean
     description: |
