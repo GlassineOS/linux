@@ -84,6 +84,28 @@ static int pm8916_wdt_configure_timers(struct watchdog_device *wdev)
 			    wdev->pretimeout);
 }
 
+/* the period a running watchdog was given: S1 + S2, the bark at S2 if it can bark */
+static int pm8916_wdt_read_timers(struct pm8916_wdt *wdt, bool pretimeout)
+{
+	unsigned int s1, s2;
+	int err;
+
+	err = regmap_read(wdt->regmap, wdt->baseaddr + PON_PMIC_WD_RESET_S1_TIMER, &s1);
+	if (!err)
+		err = regmap_read(wdt->regmap, wdt->baseaddr + PON_PMIC_WD_RESET_S2_TIMER, &s2);
+	if (err)
+		return err;
+	s1 &= 0x7f;
+	s2 &= 0x7f;
+	if (!s1 || s1 + s2 > PM8916_WDT_MAX_TIMEOUT)
+		return 0;	/* not a period this driver sets: use the default */
+	wdt->wdev.timeout = s1 + s2;
+	wdt->wdev.pretimeout = pretimeout ? s2 : 0;
+	dev_info(wdt->wdev.parent, "running with %u s (S1 %u, S2 %u): kept\n",
+		 s1 + s2, s1, s2);
+	return 0;
+}
+
 static int pm8916_wdt_set_timeout(struct watchdog_device *wdev,
 				  unsigned int timeout)
 {
@@ -143,6 +165,7 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 	struct pm8916_wdt *wdt;
 	struct device *parent;
 	unsigned int val;
+	bool running;
 	int err, irq;
 	u8 poff[2];
 
@@ -211,6 +234,7 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 		dev_info(dev, "running at probe (left enabled by the previous boot)\n");
 		set_bit(WDOG_HW_RUNNING, &wdt->wdev.status);
 	}
+	running = val & S2_RESET_EN_BIT;
 
 	/* Configure watchdog to hard-reset mode */
 	err = regmap_write(wdt->regmap,
@@ -231,6 +255,16 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, wdt);
 
 	watchdog_init_timeout(&wdt->wdev, 0, dev);
+	if (running) {
+		/*
+		 * Keep the period it runs with. Rewriting the timers with the default
+		 * would cut the time left (60 s set by the last kernel, 32 s here)
+		 * before the first ping.
+		 */
+		err = pm8916_wdt_read_timers(wdt, irq > 0);
+		if (err)
+			return err;
+	}
 	pm8916_wdt_configure_timers(&wdt->wdev);
 	/* never left counting across a reboot or power-off, into a kernel that may not pet it */
 	watchdog_stop_on_reboot(&wdt->wdev);
@@ -242,7 +276,8 @@ static int __maybe_unused pm8916_wdt_suspend(struct device *dev)
 {
 	struct pm8916_wdt *wdt = dev_get_drvdata(dev);
 
-	if (watchdog_active(&wdt->wdev))
+	/* also one only the core pets (running at probe, not opened yet) */
+	if (watchdog_active(&wdt->wdev) || watchdog_hw_running(&wdt->wdev))
 		return pm8916_wdt_stop(&wdt->wdev);
 
 	return 0;
@@ -252,7 +287,7 @@ static int __maybe_unused pm8916_wdt_resume(struct device *dev)
 {
 	struct pm8916_wdt *wdt = dev_get_drvdata(dev);
 
-	if (watchdog_active(&wdt->wdev)) {
+	if (watchdog_active(&wdt->wdev) || watchdog_hw_running(&wdt->wdev)) {
 		/*
 		 * A fresh period first: userspace (frozen until later in the resume) gets the
 		 * whole timeout for its next ping, whatever the count held when it stopped.
