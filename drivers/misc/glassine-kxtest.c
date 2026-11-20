@@ -27,11 +27,9 @@
  *                                      interrupts off (hard lockup detector)
  *                        irqoff_all    stop_machine(): every CPU spins with
  *                                      interrupts off (only the HW watchdog)
- *                        bite          the highest online CPU, interrupts off,
- *                                      programs the APSS watchdog to bark and
- *                                      bite in 128 ms (what qcom-wdt's restart
- *                                      handler does) and spins: does a bite reset
- *                                      the machine at all?
+ *                      There is no bite on request: the APSS watchdog's bite
+ *                      does not reset this board (it hangs), so nothing here
+ *                      writes the APSS watchdog; kxtest.wdt reads it only.
  *   kxtest.wdt_regs    (sysfs, read) the APSS watchdog's registers now:
  *                      "en=1 sts=0x… cnt=… exp=… bark=… bite=…" (cnt = sts bits
  *                      20:1, exp = bit 0; ticks at 32768/s)
@@ -71,7 +69,6 @@ static unsigned int kx_backstop;
 module_param_named(backstop, kx_backstop, uint, 0444);
 
 /* the kpss watchdog (qcom-wdt reg_offset_data_kpss) */
-#define KX_WDT_RST	0x04
 #define KX_WDT_EN	0x08
 #define KX_WDT_STS	0x0c
 #define KX_WDT_BARK	0x10
@@ -110,27 +107,6 @@ static const struct kernel_param_ops kx_wdt_regs_ops = {
 	.get = kx_wdt_regs_get,
 };
 module_param_cb(wdt_regs, &kx_wdt_regs_ops, NULL, 0444);
-
-static int kx_bite(void *unused)
-{
-	void __iomem *b = kx_wdt_map();
-	u32 t = 128 * 32768 / 1000;
-
-	pr_emerg("KXTEST: bite: cpu %d, interrupts off, bark and bite in 128 ms\n",
-		 smp_processor_id());
-	if (!b)
-		return -ENODEV;
-	local_irq_disable();
-	writel(0, b + KX_WDT_EN);
-	writel(1, b + KX_WDT_RST);
-	writel(t, b + KX_WDT_BARK);
-	writel(t, b + KX_WDT_BITE);
-	writel(1, b + KX_WDT_EN);
-	wmb();
-	for (;;)
-		cpu_relax();
-	return 0;
-}
 
 static void kx_wdt_log(const char *when, bool twice)
 {
@@ -198,18 +174,6 @@ static int kx_trigger_set(const char *val, const struct kernel_param *kp)
 			return -EINVAL;	/* would take the backstop's CPU */
 		kx_arm_backstop("irqoff_one");
 		t = kthread_create(kx_spin_one, NULL, "kxtest-spin");
-		if (IS_ERR(t))
-			return PTR_ERR(t);
-		kthread_bind(t, cpu);
-		wake_up_process(t);
-	} else if (sysfs_streq(val, "bite")) {
-		unsigned int cpu = cpumask_last(cpu_online_mask);
-		struct task_struct *t;
-
-		if (cpu == cpumask_first(cpu_online_mask))
-			return -EINVAL;
-		kx_arm_backstop("bite");
-		t = kthread_create(kx_bite, NULL, "kxtest-bite");
 		if (IS_ERR(t))
 			return PTR_ERR(t);
 		kthread_bind(t, cpu);
