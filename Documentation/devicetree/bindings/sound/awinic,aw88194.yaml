@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/awinic,aw88194.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Awinic AW88194 smart audio amplifier
+
+maintainers:
+  - Moritz Meißelbach <moritz@glassine.org>
+
+description:
+  The AW88194 is a mono class-D speaker amplifier with a DSP, on I2C for
+  control and I2S for audio. The driver loads its register profile, DSP
+  firmware and DSP configuration from files before the first unmute.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: awinic,aw88194
+
+  reg:
+    maxItems: 1
+
+  "#sound-dai-cells":
+    const: 0
+
+  reset-gpios:
+    maxItems: 1
+
+  firmware-name:
+    maxItems: 1
+    description:
+      Path prefix of the files the driver loads, without the suffix. It
+      appends "_reg.bin", "_fw.bin" and "_cfg.bin".
+
+required:
+  - compatible
+  - reg
+  - "#sound-dai-cells"
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        audio-codec@35 {
+            compatible = "awinic,aw88194";
+            reg = <0x35>;
+            reset-gpios = <&gpio 94 GPIO_ACTIVE_LOW>;
+            firmware-name = "aw88194_spk";
+            #sound-dai-cells = <0>;
+        };
+    };
