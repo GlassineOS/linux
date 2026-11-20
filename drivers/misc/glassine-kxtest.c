@@ -27,6 +27,14 @@
  *                                      interrupts off (hard lockup detector)
  *                        irqoff_all    stop_machine(): every CPU spins with
  *                                      interrupts off (only the HW watchdog)
+ *                        bite          the highest online CPU, interrupts off,
+ *                                      programs the APSS watchdog to bark and
+ *                                      bite in 128 ms (what qcom-wdt's restart
+ *                                      handler does) and spins: does a bite reset
+ *                                      the machine at all?
+ *   kxtest.wdt_regs    (sysfs, read) the APSS watchdog's registers now:
+ *                      "en=1 sts=0x… cnt=… exp=… bark=… bite=…" (cnt = sts bits
+ *                      20:1, exp = bit 0; ticks at 32768/s)
  *   kxtest.backstop=S  with a hang or trigger: emergency restart S s later from a
  *                      timer on CPU 0 (never the CPU irqoff_one takes); 0 = none.
  *                      It cannot help early_irqoff or irqoff_all.
@@ -63,26 +71,74 @@ static unsigned int kx_backstop;
 module_param_named(backstop, kx_backstop, uint, 0444);
 
 /* the kpss watchdog (qcom-wdt reg_offset_data_kpss) */
+#define KX_WDT_RST	0x04
 #define KX_WDT_EN	0x08
 #define KX_WDT_STS	0x0c
 #define KX_WDT_BARK	0x10
 #define KX_WDT_BITE	0x14
 
-static void kx_wdt_log(const char *when, bool twice)
+static void __iomem *kx_wdt_map(void)
 {
 	struct device_node *np;
 	void __iomem *b;
-	u32 sts;
 
 	np = of_find_compatible_node(NULL, NULL, "qcom,kpss-wdt");
-	if (!np) {
-		pr_info("KXTEST: wdt %s: no qcom,kpss-wdt node\n", when);
-		return;
-	}
+	if (!np)
+		return NULL;
 	b = of_iomap(np, 0);
 	of_node_put(np);
+	return b;
+}
+
+static int kx_wdt_regs_get(char *buf, const struct kernel_param *kp)
+{
+	void __iomem *b = kx_wdt_map();
+	u32 sts;
+	int n;
+
+	if (!b)
+		return sysfs_emit(buf, "none\n");
+	sts = readl(b + KX_WDT_STS);
+	n = sysfs_emit(buf, "en=%u sts=0x%08x cnt=%u exp=%u bark=%u bite=%u\n",
+		       readl(b + KX_WDT_EN), sts, (sts >> 1) & 0xfffff, sts & 1,
+		       readl(b + KX_WDT_BARK), readl(b + KX_WDT_BITE));
+	iounmap(b);
+	return n;
+}
+
+static const struct kernel_param_ops kx_wdt_regs_ops = {
+	.get = kx_wdt_regs_get,
+};
+module_param_cb(wdt_regs, &kx_wdt_regs_ops, NULL, 0444);
+
+static int kx_bite(void *unused)
+{
+	void __iomem *b = kx_wdt_map();
+	u32 t = 128 * 32768 / 1000;
+
+	pr_emerg("KXTEST: bite: cpu %d, interrupts off, bark and bite in 128 ms\n",
+		 smp_processor_id());
+	if (!b)
+		return -ENODEV;
+	local_irq_disable();
+	writel(0, b + KX_WDT_EN);
+	writel(1, b + KX_WDT_RST);
+	writel(t, b + KX_WDT_BARK);
+	writel(t, b + KX_WDT_BITE);
+	writel(1, b + KX_WDT_EN);
+	wmb();
+	for (;;)
+		cpu_relax();
+	return 0;
+}
+
+static void kx_wdt_log(const char *when, bool twice)
+{
+	void __iomem *b = kx_wdt_map();
+	u32 sts;
+
 	if (!b) {
-		pr_info("KXTEST: wdt %s: cannot map\n", when);
+		pr_info("KXTEST: wdt %s: no qcom,kpss-wdt node or cannot map\n", when);
 		return;
 	}
 	sts = readl(b + KX_WDT_STS);
@@ -142,6 +198,18 @@ static int kx_trigger_set(const char *val, const struct kernel_param *kp)
 			return -EINVAL;	/* would take the backstop's CPU */
 		kx_arm_backstop("irqoff_one");
 		t = kthread_create(kx_spin_one, NULL, "kxtest-spin");
+		if (IS_ERR(t))
+			return PTR_ERR(t);
+		kthread_bind(t, cpu);
+		wake_up_process(t);
+	} else if (sysfs_streq(val, "bite")) {
+		unsigned int cpu = cpumask_last(cpu_online_mask);
+		struct task_struct *t;
+
+		if (cpu == cpumask_first(cpu_online_mask))
+			return -EINVAL;
+		kx_arm_backstop("bite");
+		t = kthread_create(kx_bite, NULL, "kxtest-bite");
 		if (IS_ERR(t))
 			return PTR_ERR(t);
 		kthread_bind(t, cpu);
