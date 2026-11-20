@@ -29,6 +29,9 @@ patternProperties:
     properties:
       opp-hz: true
       required-opps: true
+      opp-microwatt: true
+      opp-peak-kBps: true
+      opp-avg-kBps: true
 
       qcom,pll-override:
         $ref: /schemas/types.yaml#/definitions/uint32
