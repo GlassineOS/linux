@@ -6,6 +6,7 @@ on:
     branches:
       - qcom-sdm660-6.*.y
       - qcom-sdm660-7.*.y
+      - glassine/sdm660-*
     tags:
       - v*-sdm660
 jobs:
