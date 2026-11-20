@@ -124,6 +124,14 @@ patternProperties:
     $ref: regulator.yaml#
     unevaluatedProperties: false
 
+    properties:
+      qcom,sleep-load-microamp:
+        description:
+          Also vote the RPM's sleep set for this regulator, with this load.
+          The sleep vote enables the regulator at the active set's voltage.
+          Without one, the RPM keeps the active set's vote while the
+          application processor sleeps.
+
 additionalProperties: false
 
 required:
