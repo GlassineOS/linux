@@ -941,6 +941,7 @@ properties:
               - motorola,beckham
               - bbry,luna-boe
               - bbry,luna-syna
+              - onyx,noteair
           - const: qcom,sdm636
 
       - items:
