@@ -585,5 +585,16 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+config GLASSINE_KXTEST
+	bool "Glassine kexec probe test hooks (deliberate hangs, register dumps)"
+	depends on ARCH_QCOM
+	help
+	  Test hooks for the kexec probes on the Note Air: watchdog register
+	  dumps, remote processor line states, and deliberate hangs and panics
+	  on request (kxtest.* on the command line or in sysfs). Only for
+	  throw-away probe kernels: a system kernel must never have it.
+
+	  If unsure, say N.
+
 source "drivers/misc/issei/Kconfig"
 endmenu
