@@ -2,10 +2,12 @@
 #include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/kexec.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/property.h>
 #include <linux/platform_device.h>
+#include <linux/reboot.h>
 #include <linux/regmap.h>
 #include <linux/watchdog.h>
 
@@ -39,8 +41,21 @@
 struct pm8916_wdt {
 	struct regmap *regmap;
 	struct watchdog_device wdev;
+	struct notifier_block reboot_nb;
 	u32 baseaddr;
 };
+
+/*
+ * The watchdog counts in the PMIC, which a kexec does not touch. Stopped on kexec
+ * like on any reboot, by default. With keep_on_kexec it is pinged once more and left
+ * running: the next kernel then has one full period to take it over (its driver
+ * finds it running at probe), and a next kernel that hangs before that is reset by
+ * the PMIC.
+ */
+static bool keep_on_kexec;
+module_param(keep_on_kexec, bool, 0644);
+MODULE_PARM_DESC(keep_on_kexec,
+		 "Leave a running watchdog enabled across kexec, pinged once, for the next kernel (default: stop it, as on any reboot)");
 
 static int pm8916_wdt_start(struct watchdog_device *wdev)
 {
@@ -120,6 +135,27 @@ static int pm8916_wdt_set_pretimeout(struct watchdog_device *wdev,
 	wdev->pretimeout = pretimeout;
 
 	return pm8916_wdt_configure_timers(wdev);
+}
+
+/* on reboot and power-off: stop it, so it never counts into a boot that does not pet it */
+static int pm8916_wdt_reboot(struct notifier_block *nb, unsigned long code, void *data)
+{
+	struct pm8916_wdt *wdt = container_of(nb, struct pm8916_wdt, reboot_nb);
+	struct watchdog_device *wdev = &wdt->wdev;
+
+	if (code != SYS_DOWN && code != SYS_HALT && code != SYS_POWER_OFF)
+		return NOTIFY_DONE;
+	if (!watchdog_hw_running(wdev))
+		return NOTIFY_DONE;
+	if (kexec_in_progress && READ_ONCE(keep_on_kexec)) {
+		if (!pm8916_wdt_ping(wdev)) {
+			dev_emerg(wdev->parent, "kexec: left running, %u s for the next kernel\n",
+				  wdev->timeout);
+			return NOTIFY_DONE;
+		}
+		/* without a fresh period the next kernel's time is unknown: stop it */
+	}
+	return pm8916_wdt_stop(wdev) ? NOTIFY_BAD : NOTIFY_DONE;
 }
 
 static irqreturn_t pm8916_wdt_isr(int irq, void *arg)
@@ -266,8 +302,15 @@ static int pm8916_wdt_probe(struct platform_device *pdev)
 			return err;
 	}
 	pm8916_wdt_configure_timers(&wdt->wdev);
-	/* never left counting across a reboot or power-off, into a kernel that may not pet it */
-	watchdog_stop_on_reboot(&wdt->wdev);
+	/*
+	 * Never left counting across a reboot or power-off, into a boot that may not pet
+	 * it; across a kexec only with keep_on_kexec (the driver's own notifier, not
+	 * watchdog_stop_on_reboot(), which stops it on kexec too).
+	 */
+	wdt->reboot_nb.notifier_call = pm8916_wdt_reboot;
+	err = devm_register_reboot_notifier(dev, &wdt->reboot_nb);
+	if (err)
+		return err;
 
 	return devm_watchdog_register_device(dev, &wdt->wdev);
 }
