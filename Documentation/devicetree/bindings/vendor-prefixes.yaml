@@ -1257,6 +1257,8 @@ patternProperties:
     description: ON Semiconductor Corp.
   "^ontat,.*":
     description: On Tat Industrial Company
+  "^onyx,.*":
+    description: Onyx International Inc.
   "^opalkelly,.*":
     description: Opal Kelly Incorporated
   "^openailab,.*":
