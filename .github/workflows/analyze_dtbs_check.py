@@ -26,7 +26,7 @@ def short_dtb_path(line: str) -> str:
     return dtb_part + '.dtb:' + errmsg
 
 def main() -> int:
-    if len(sys.argv) < 1:
+    if len(sys.argv) < 2:
         print('Expected results file as an argument')
         return 1
 
@@ -62,7 +62,9 @@ def main() -> int:
         for l in error_texts:
             print(l)
     print(f'Errors: {errors_left} ({errors_count} total, {errors_ignored} ignored)')
-    return errors_left
+    # an exit status is 8 bits: returning the count made 256 errors exit 0 and
+    # 393 exit 137, which reads like an OOM kill
+    return 1 if errors_left > 0 else 0
 
 
 if __name__ == '__main__':
