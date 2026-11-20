@@ -56,6 +56,16 @@
 	chosen {
 	};
 
+	/*
+	 * Fixed watchdog numbers (without aliases the order is the probe order):
+	 * watchdog0 is the PMIC's, the one that resets this board, so /dev/watchdog and
+	 * anything that opens watchdog0 get it; watchdog1 is the APSS watchdog.
+	 */
+	aliases {
+		watchdog0 = &pm660_wdt;
+		watchdog1 = &apss_wdt;
+	};
+
 	reserved-memory {
 		/* ABL leaves the display pipeline scanning out of this; keep it untouched. */
 		cont_splash: splash-region@9d400000 {
@@ -616,6 +626,20 @@
 	status = "okay";
 };
 
+/*
+ * pm660's own watchdog in its PON block (0x854-0x858, the pm8916 layout; the stock DT
+ * has no node for it). It counts in the PMIC and resets over the PMIC's own path, so it
+ * covers hangs the APSS watchdog does not (in a test, its bite set the expired bit and
+ * the board hung instead of resetting). Off
+ * until userspace opens it; the driver stops it on suspend and on reboot.
+ */
+&pon {
+	pm660_wdt: watchdog {
+		compatible = "qcom,pm8916-wdt";
+		interrupts = <0x0 0x8 6 IRQ_TYPE_EDGE_RISING>;
+	};
+};
+
 &qusb2phy0 {
 	vdd-supply = <&vreg_l1b_0p925>;
 	vdda-pll-supply = <&vreg_l10a_1p8>;
@@ -838,7 +862,7 @@
 
 &soc {
 	/* Stock qcom,wdt@17817000 (bark = GIC SPI 3). Petted by the initramfs. */
-	watchdog@17817000 {
+	apss_wdt: watchdog@17817000 {
 		compatible = "qcom,kpss-wdt";
 		reg = <0x17817000 0x1000>;
 		clocks = <&sleep_clk>;
