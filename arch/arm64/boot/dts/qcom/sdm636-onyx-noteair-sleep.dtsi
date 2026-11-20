@@ -23,7 +23,7 @@
 
 &{/cpus} {
 	domain-idle-states {
-		system_pc: system-pc {
+		system_pc: domain-system-pc {
 			compatible = "domain-idle-state";
 			arm,psci-suspend-param = <0x42000343>;
 			/* stock: latency 4506 us, time overhead 15337 us */
@@ -75,7 +75,10 @@
 	};
 };
 
-&{/soc@0} {
+/* At the root, not under soc@0: it has no registers of its own (a simple-bus
+ * child needs reg or ranges). Root nodes are populated in the same pass as
+ * soc@0's children, so the probe order stays as it was. */
+/ {
 	/* stock qcom,mpm@7781b8 (mpm-v2): wake IRQ SPI 171, IPC bit 1, 96 pins;
 	 * pin map = its gic-map minus 32 (TSENS, the USB PHYs, SPMI), one pin
 	 * per SPI (stock maps QUSB2 DP/DM twice; the SPMI charger covers USB
