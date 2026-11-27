@@ -1938,6 +1938,49 @@ static const struct irq_domain_ops pmic_arb_irq_domain_ops = {
 	.translate = qpnpint_irq_domain_translate,
 };
 
+/*
+ * A kernel started by kexec inherits the arbiter's interrupt state: an
+ * accumulated interrupt the previous kernel enabled, for a peripheral no
+ * driver of this kernel maps, stays pending and outside min_apid..max_apid,
+ * so pmic_arb_chained_irq() never clears it and the summary interrupt storms.
+ * Turn off every accumulated enable this EE owns before the chained handler
+ * goes in; qpnpint_irq_unmask() sets it again for each interrupt a driver
+ * requests.
+ */
+static void pmic_arb_quiesce_acc(struct spmi_pmic_arb_bus *bus)
+{
+	struct spmi_pmic_arb *pmic_arb = bus->pmic_arb;
+	const struct pmic_arb_ver_ops *ver_ops = pmic_arb->ver_ops;
+	u32 offset, owner, map, enable;
+	unsigned int n, count = 0;
+
+	if (!ver_ops->apid_owner || !ver_ops->apid_map_offset || bus->base_apid)
+		return;
+
+	for (n = 0; n < pmic_arb->max_periphs; n++) {
+		offset = ver_ops->apid_map_offset(n);
+		if (offset >= pmic_arb->core_size)
+			break;
+		/* an empty slot has no interrupt registers: reading them hangs */
+		map = readl_relaxed(pmic_arb->core + offset);
+		if (!map)
+			continue;
+		owner = readl_relaxed(ver_ops->apid_owner(bus, n));
+		if (SPMI_OWNERSHIP_PERIPH2OWNER(owner) != pmic_arb->ee)
+			continue;
+		enable = readl_relaxed(ver_ops->acc_enable(bus, n));
+		if (!(enable & SPMI_PIC_ACC_ENABLE_BIT))
+			continue;
+		writel_relaxed(0, ver_ops->acc_enable(bus, n));
+		dev_info(bus->spmic->dev.parent,
+			 "inherited interrupt enable off: apid=%u sid=0x%x per=0x%02x\n",
+			 n, (map >> 16) & 0xf, (map >> 8) & 0xff);
+		count++;
+	}
+	if (count)
+		dev_info(bus->spmic->dev.parent, "%u inherited interrupt enables off\n", count);
+}
+
 static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 				  struct device_node *node,
 				  struct spmi_pmic_arb *pmic_arb)
@@ -2025,6 +2068,8 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 		dev_err(&pdev->dev, "unable to create irq_domain\n");
 		return -ENOMEM;
 	}
+
+	pmic_arb_quiesce_acc(bus);
 
 	irq_set_chained_handler_and_data(bus->irq,
 					 pmic_arb_chained_irq, bus);
