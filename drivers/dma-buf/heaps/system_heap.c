@@ -183,6 +183,26 @@ static void system_heap_unmap_dma_buf(struct dma_buf_attachment *attachment,
 	dma_unmap_sgtable(attachment->dev, table, direction, 0);
 }
 
+/*
+ * Whether ending a CPU access must hand the attachments' lines back with
+ * dma_sync_*_for_device(). On arm64 that is a clean to the point of
+ * coherency, whatever the direction (arch_sync_dma_for_device()), and
+ * dma_sync_*_for_cpu() invalidates for every direction but DMA_TO_DEVICE.
+ * A read-only access (DMA_BUF_SYNC_READ, DMA_FROM_DEVICE) started with that
+ * invalidate and leaves only clean lines behind, CPU fills and speculative
+ * fills alike: a clean line is never written back, so it cannot overwrite
+ * what a device writes next, and a device that reads next finds the same
+ * bytes in memory. The next CPU access invalidates again at its begin. The
+ * clean would walk the whole range for nothing.
+ *
+ * Other architectures may invalidate in for_device() and rely on it (no
+ * speculative fills, nothing done in for_cpu()): keep the sync there.
+ */
+static bool system_heap_end_cpu_needs_sync(enum dma_data_direction direction)
+{
+	return !IS_ENABLED(CONFIG_ARM64) || direction != DMA_FROM_DEVICE;
+}
+
 static int system_heap_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
 						enum dma_data_direction direction)
 {
@@ -215,11 +235,15 @@ static int system_heap_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
 	if (buffer->vmap_cnt)
 		flush_kernel_vmap_range(buffer->vaddr, buffer->len);
 
+	if (!system_heap_end_cpu_needs_sync(direction))
+		goto out;
+
 	list_for_each_entry(a, &buffer->attachments, list) {
 		if (!a->mapped)
 			continue;
 		dma_sync_sgtable_for_device(a->dev, &a->table, direction);
 	}
+out:
 	mutex_unlock(&buffer->lock);
 
 	return 0;
@@ -326,6 +350,9 @@ system_heap_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
 	if (buffer->vmap_cnt)
 		flush_kernel_vmap_range(buffer->vaddr + offset, len);
 
+	if (!system_heap_end_cpu_needs_sync(direction))
+		goto out;
+
 	list_for_each_entry(a, &buffer->attachments, list) {
 		if (!a->mapped)
 			continue;
@@ -334,6 +361,7 @@ system_heap_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
 		dev_dbg_ratelimited(a->dev, "range sync: whole table instead\n");
 		dma_sync_sgtable_for_device(a->dev, &a->table, direction);
 	}
+out:
 	mutex_unlock(&buffer->lock);
 
 	return 0;
